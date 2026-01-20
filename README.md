@@ -97,12 +97,18 @@ pyinstaller --noconfirm --onedir --windowed --name "師大課程查詢系統" --
 
 ## (12) GitHub操作指令
 # 初始化
-```bash
+```
+(
+echo.
+echo # ignore build outputs
+echo dist/
+echo build/
+)>> .gitignore
 git init
 git branch -M main
 git remote add origin https://github.com/peicd100/ntnu_course_query.git
-git add . ":(exclude)dist" ":(exclude)build"
-git commit -m "Initial commit"
+git add .
+git commit -m "PEICD100"
 git push -u origin main
 ```
 
