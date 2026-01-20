@@ -15,7 +15,8 @@ from:https://chatgpt.com/g/g-p-694775493bb48191a277ba30b540ae2c-peicd/c/696b7d83
 # Git / GitHub 原則（已採用）：
 # - Agent 禁止在終端機執行任何 git 指令（版本控制一律由使用者自行處理）
 # - README.md 必須包含可複製的 GitHub 操作指令（僅文件；不執行）
-# - dist/、build/ 不上傳：改用 .gitignore（由使用者自行執行初始化指令寫入），例行上傳用 git add .
+# - dist/、build/ 不上傳：改用 .gitignore（由使用者自行執行初始化指令寫入）
+# - 例行上傳：固定使用 git push -u origin main（由使用者自行執行）
 #
 # 重要變更（已採用）：
 # - 不使用 backup/ 備份（版本控制由使用者自行處理）
@@ -280,7 +281,7 @@ README.md 必須至少包含以下章節（可依專案擴充，但不得刪除�
     ```
     git add .
     git commit -m "PEICD100"
-    git push
+    git push -u origin main
     ```
 
     # 還原成Git Hub最新資料
