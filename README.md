@@ -108,7 +108,7 @@ git push -u origin main
 
 # 例行上傳
 ```bash
-git add . ":(exclude)dist" ":(exclude)build"
+git add .
 git commit -m "PEICD100"
 git push
 ```
