@@ -2,293 +2,241 @@
 
 ## 1. 專案概述
 
-「師大課程查詢系統」是一套以 **PySide6（Qt for Python）** 製作的桌面 GUI 工具，透過讀取師大課程 Excel 檔（.xls / .xlsx），提供：
+本專案為桌面版「課程查詢與排課系統」，以 `python app_main.py` 作為唯一入口。
 
-* 多條件課程查詢（開課序號、開課代碼、課名、教師、系所、全面關鍵字）。
-* 課程分類快速篩選（通識 / 一般體育 / 教育學程）。
-* 我的最愛管理（勾選顯示於課表、鎖定課程、拖曳排序、優先度）。
-* 課表檢視（支援衝突顯示、顯示時間列、顯示週六、縮放）。
-* 時段選取篩課（以滑鼠拖曳課表格子選取可上課時段，並可設定匹配模式）。
-* 使用者歷史紀錄（只讀檢視歷史檔、套用歷史紀錄）。
-* 最佳選課（在「已選/候選」最愛中，依「總學分最大化」並以「優先度和」作為同分排序，輸出最多 5 組方案檔）。
+核心功能（依程式現況）：
 
-本專案以 Windows 11 + Conda（Miniforge/Anaconda）為主要安裝與執行環境，並以 `app_main.py` 作為唯一入口點。
+* 課程 Excel 載入：支援 `.xls / .xlsx`；可由「檔案 → 開啟課程 Excel…」選取，系統會自動複製到 `user_data/course_inputs/` 並讀取。
+* 多條件查詢：開課序號、開課代碼、科目名稱、教師、全面搜尋、系所；可搭配通識/體育/教育學程等選項與「未滿額、排除衝突、排除已選、顯示無時間」等條件。
+* 我的最愛與課表：可將課程加入「我的最愛」，並勾選是否顯示於課表；支援「鎖定」課程（鎖定課程強制顯示於課表）。
+* 課表檢視：顯示已選總學分、已鎖定學分；可切換顯示週六與顯示時間。
+* 歷史紀錄：可檢視過往使用者檔案並以只讀模式預覽。
+* 最佳選課：以目前「我的最愛」為候選，計算並輸出多個不衝堂的最佳組合（最多 5 個結果），輸出為 Excel 檔。
 
----
+## 2. 重要變數（必填）
 
-## 2. 重要變數
+1. ENV_NAME：`course_query`
 
-* ENV_NAME：`course_query`
-* workspace root(EXE_NAME)：`師大課程查詢系統`
+   * 英文小寫 + 底線
+   * 同時作為 GitHub repository 命名依據
+2. workspace root(EXE_NAME)：`師大課程查詢系統`
 
----
+   * 專案根目錄資料夾名稱（basename）
 
 ## 3. workspace root(EXE_NAME) 定義
 
-* **workspace root(EXE_NAME)** 代表：
+* workspace root(EXE_NAME) 指「專案根目錄資料夾名稱（basename）」。
+* 本專案文件敘述一律使用名詞 **workspace root(EXE_NAME)**；在命令列/檔名/路徑上，需直接使用其實際值 `師大課程查詢系統`。
+* 格式限制：
 
-  1. 你在本機存放專案的資料夾名稱（建議直接使用此名稱）。
-  2. 使用 PyInstaller 打包後的 `.exe` 主要輸出名稱（建議與資料夾同名，以利辨識與佈署）。
+  * 必須是 basename（不得包含 `/` 或 `\`）
+  * 不得包含括號字樣 `(` `)`
 
----
+## 4. 檔案與資料夾結構（樹狀；最小必要集合）
 
-## 4. 檔案與資料夾結構
-
-以下為最小必要結構（含 `user_data/` 規範資料夾；其子資料夾多由程式首次執行時自動建立）：
+以下為本專案運作所需的最小集合（以 workspace root(EXE_NAME) 的實際值展示）：
 
 ```
 師大課程查詢系統/
-  README.md
-  app_main.py
-  app_constants.py
-  app_excel.py
-  app_mainwindow.py
-  app_timetable_logic.py
-  app_user_data.py
-  app_utils.py
-  app_widgets.py
-  app_workers.py
-  user_data/
-    .gitkeep
-    course_inputs/
-      .gitkeep
-    user_schedules/
-      .gitkeep
-  dist/
-  build/
+├─ README.md
+├─ app_main.py
+├─ app_constants.py
+├─ app_excel.py
+├─ app_mainwindow.py
+├─ app_timetable_logic.py
+├─ app_user_data.py
+├─ app_utils.py
+├─ app_widgets.py
+├─ app_workers.py
+├─ user_data/
+│  ├─ course_inputs/
+│  └─ user_schedules/
+├─ dist/                       （可能存在；打包輸出資料夾）
+├─ build/                      （可能存在；打包中間產物）
+└─ .gitignore                  （可能存在；需忽略 dist/、build/）
 ```
 
-* `app_main.py`：唯一入口點（GUI 啟動與 smoke test）。
-* `app_mainwindow.py`：主視窗與主要互動邏輯。
-* `app_excel.py`：Excel 讀取、工作表選擇、必要欄位驗證、資料清理與索引欄位生成。
-* `app_timetable_logic.py`：課表矩陣生成、衝突檢測與車道（lane）排版。
-* `app_user_data.py`：使用者資料檔（.xlsx）讀寫、歷史紀錄與最佳方案輸出路徑。
-* `app_workers.py`：背景執行（自動儲存、最佳選課運算與輸出）。
-* `app_widgets.py`：GUI 元件（課表、結果表格、我的最愛表格等）。
-* `user_data/`：使用者資料與輸入課程檔的**唯一落地位置**（打包後亦需保留）。
-* `dist/`、`build/`：PyInstaller 產物（通常不提交版本控制）。
+## 5. Python 檔名規則（app_main.py + app_*.py 同層）
 
----
+* 主入口檔：`app_main.py`
+* 模組檔：`app_*.py`
+* `app_main.py` 與所有 `app_*.py` 必須位於同一層（workspace root(EXE_NAME) 根目錄）。
 
-## 5. Python 檔名規則
+## 6. user_data/ 規範
 
-* **入口檔固定**：`app_main.py`。
-* 其他模組檔名均以 `app_*.py` 命名，維持「功能分層」與「可追蹤性」。
-* 若未來擴充：
+本專案所有「輸入／輸出／設定」預設放在 `user_data/`，並由程式自動建立必要資料夾。
 
-  * GUI / 視窗：優先放在 `app_mainwindow.py` 或拆分到 `app_views_*.py`（仍以 `app_` 為前綴）。
-  * 純計算邏輯：優先放在 `app_utils.py` / `app_timetable_logic.py` / `app_workers.py`。
+### 6.1 課程 Excel 放置規範
 
----
+* 預設課程輸入資料夾：`user_data/course_inputs/`
+* 你可以：
 
-## 6. user_data/ 資料夾規範
+  1. 直接把課程 Excel 放入 `user_data/course_inputs/`（支援 `.xls / .xlsx`），再啟動程式。
+  2. 或於程式內使用「檔案 → 開啟課程 Excel…」選取檔案；選取後會自動複製到 `user_data/course_inputs/`。
 
-### 6.1 目的
+### 6.2 課程 Excel 內容要求（欄位）
 
-`user_data/` 是本程式所有可變資料（輸入檔、副本、使用者狀態、輸出方案）的唯一落地位置，方便：
+程式會檢查課程 Excel 是否具備必要欄位；缺少欄位會視為格式錯誤。
 
-* 專案資料與使用者資料分離。
-* 打包後可直接攜帶 `user_data/` 進行移機或備份。
+必要欄位（REQUIRED_COLUMNS）：
 
-### 6.2 子資料夾與用途
+* 開課序號
+* 開課代碼
+* 系所
+* 中文課程名稱
+* 教師
+* 學分
+* 必/選
+* 全/半
+* 地點時間
+* 限修人數
+* 選修人數
 
-* `user_data/course_inputs/`
+工作表選擇：
 
-  * 放置「課程 Excel」檔案（`.xls` / `.xlsx`）。
-  * 程式啟動時會嘗試自動載入此資料夾中的課程檔。
-  * 透過「檔案 → 開啟課程 Excel…」選取檔案後，程式會自動將檔案**複製**到此資料夾，再進行讀取。
+* 優先尋找工作表名稱 `課程 / Courses / Sheet1`；若都不存在，會使用第一個工作表。
 
-* `user_data/user_schedules/`
+`.xls` 注意事項：
 
-  * 使用者資料根目錄；每位使用者會建立一個資料夾（名稱會做安全化處理）。
-  * 每位使用者下至少包含：
+* 讀取 `.xls` 需要 `xlrd`；若未安裝，程式會提示安裝。
 
-    * `history/`：登入時自動建立的本次登入檔（`YYYYMMDD_HHMMSS.xlsx`），並由程式自動儲存更新。
-    * `best_schedule/`：最佳選課輸出（多個 `.xlsx`）與快取（`best_schedule_cache.json`）。
+### 6.3 使用者資料保存規範
 
-### 6.3 使用者檔案格式（.xlsx）
+* 使用者資料保存根目錄：`user_data/user_schedules/`
+* 每位使用者會建立一個子資料夾（以使用者名稱清理後作為資料夾名）。
+* 主要子資料夾：
 
-每個使用者檔案包含兩個工作表：
+  * `history/`：每次「新增/切換」登入會建立一個時間戳的 Excel（作為該次會話檔）。
+  * `best_schedule/`：最佳選課輸出的 Excel 檔，以及 `best_schedule_cache.json` 快取。
 
-* `我的最愛`
+使用者檔案格式（Excel）：
 
-  * 欄位：`開課序號`、`課表`（是否顯示於課表）、`鎖定`（強制保留於課表）、`加入順序`（用於優先度/最佳選課排序）。
+* 工作表 `我的最愛`：包含「開課序號 / 課表 / 鎖定 / 加入順序」。
+* 工作表 `課表匯出`：匯出顯示於課表的課程明細（含 `_tba`、`_slots` 等欄位）。
 
-* `課表匯出`
+## 7. Conda 環境（ENV_NAME）與安裝規範
 
-  * 匯出目前顯示於課表的課程明細（保留原始欄位並附加 `_tba`、`_slots`）。
-
----
-
-## 7. Conda 環境（course_query）與安裝規範
-
-### 7.1 取得專案原始碼（必做）
-
-請先完成 clone 與進入專案目錄（以下命令必須置於同一個文字框內）：
+本章節最前面必須先提供 `git clone` 與 `cd` 兩行命令（同一個文字框）。
 
 ```
 git clone https://github.com/peicd100/course_query.git 師大課程查詢系統
 cd 師大課程查詢系統
 ```
 
-### 7.2 Excel 檔格式要求（讀取前檢核）
+以下提供三套安裝方案（Windows CMD）。
 
-課程 Excel 的目標工作表必須包含下列欄位（缺一不可）：
+### A. 推薦方案（conda 優先）
 
-* `開課序號`
-* `開課代碼`
-* `中文課程名稱`
-* `教師`
-* `學分`
-* `系所`
-* `上課時間`
-* `人數`
-* `限修人數`
-
-說明：
-
-* `.xlsx` 依賴 `openpyxl`。
-* `.xls` 可能需要額外安裝 `xlrd`（建議一併安裝以避免讀取失敗）。
-
-### 7.3 安裝方案（請擇一；Windows CMD；可一鍵複製）
-
-注意事項：
-
-* 下列命令皆以 **Windows CMD** 為基準（啟用 conda 請使用 `call conda.bat activate ...`）。
-* 每套方案最後一行皆含最小驗證（匯入依賴 + 啟動 smoke test）。
-* 若你要進入完整互動模式，將最後一行的 `--smoke-test` 移除即可。
-
-#### 方案 A（建議；conda-forge 為主；pip 補足 .xls 讀取）
+* 目標：安裝成功率最高、相依一致、後續打包（PyInstaller）也一併就緒。
 
 ```
 conda create -n course_query python=3.11 -y
 call conda.bat activate course_query
-conda install -c conda-forge pyside6 numpy pandas openpyxl pyinstaller -y
-python -m pip install xlrd
-python -c "import PySide6, numpy, pandas, openpyxl, xlrd; print('deps-ok')" && python app_main.py --smoke-test
+conda install -c conda-forge pyside6 numpy pandas openpyxl xlrd pyinstaller -y
+python -c "import PySide6, numpy, pandas, openpyxl, xlrd; print('OK')"
 ```
 
-#### 方案 B（備用；若 conda 解相依遇到 Qt/平台衝突，改用 pip 安裝 GUI/打包套件）
+### B. 備援方案（conda + pip；針對 conda solver 在 GUI/打包套件上解析失敗的情境）
+
+* 目標：若 `conda-forge` 在 `pyside6` / `pyinstaller` 解析或下載上遇到問題，改用 PyPI wheel 降低卡住機率。
 
 ```
 conda create -n course_query python=3.11 -y
 call conda.bat activate course_query
-conda install -c conda-forge numpy pandas openpyxl -y
-python -m pip install pyside6 pyinstaller xlrd
-python -c "import PySide6, numpy, pandas, openpyxl, xlrd; print('deps-ok')" && python app_main.py --smoke-test
+conda install -c conda-forge numpy pandas openpyxl xlrd -y
+pip install pyside6 pyinstaller
+python -c "import PySide6, numpy, pandas, openpyxl, xlrd; print('OK')"
 ```
 
-#### 方案 C（偏向 pip；僅用 conda 建 Python 與提供 pip）
+### C. 最後手段（pip only；僅保留 conda 建環境，其餘全部 pip）
+
+* 目標：在 conda-forge 網路/solver/鏡像不穩定時，以 pip wheels 完成安裝。
 
 ```
 conda create -n course_query python=3.11 -y
 call conda.bat activate course_query
 conda install -c conda-forge pip -y
-python -m pip install pyside6 numpy pandas openpyxl xlrd pyinstaller
-python -c "import PySide6, numpy, pandas, openpyxl, xlrd; print('deps-ok')" && python app_main.py --smoke-test
+pip install pyside6 numpy pandas openpyxl xlrd pyinstaller
+python -c "import PySide6, numpy, pandas, openpyxl, xlrd; print('OK')"
 ```
 
----
+## 8. 測試方式（只測 python app_main.py；兩時點）
 
-## 8. 測試與驗證（兩個時間點）
+兩時點測試定義：
 
-### 8.1 安裝完成後（最小驗證）
+1. 安裝完成後測試：在乾淨環境中執行一次 `python app_main.py` 並確認通過。
+2. 修改／更新後回歸測試：變更完成後再次執行 `python app_main.py` 並確認通過。
 
-1. 啟用環境：
+建議操作（Windows CMD）：
+
+### 8.1 安裝完成後測試
 
 ```
 call conda.bat activate course_query
-```
-
-2. 執行 smoke test（視窗會短暫啟動後自動結束；無錯誤即視為通過）：
-
-```
-python app_main.py --smoke-test
-```
-
-### 8.2 改動程式碼後（互動驗證）
-
-請執行完整 GUI 並人工確認主要流程：
-
-```
 python app_main.py
 ```
 
-建議檢核項：
-
-* 能自動或手動載入課程 Excel。
-* 查詢條件變更能即時更新查詢結果。
-* 勾選查詢結果的「最愛」可同步到「我的最愛」。
-* 「我的最愛」中勾選「課表」可顯示在課表。
-* 「鎖定」課程在最佳選課與課表中皆強制保留。
-* 「檢視歷史紀錄」可讀取並套用歷史檔。
-* 「最佳選課」可輸出最多 5 組方案到 `best_schedule/`。
-
----
-
-## 9. 打包（PyInstaller）
-
-本章僅提供打包指令與預期輸出位置；不在此章節驗證執行檔。
-
-### 9.1 建議打包方式：onedir（較穩定）
+### 8.2 修改／更新後回歸測試
 
 ```
 call conda.bat activate course_query
-pyinstaller --noconsole --clean --name "師大課程查詢系統" app_main.py
+python app_main.py
 ```
 
-預期輸出：
+補充（可選）：
 
-* `dist/師大課程查詢系統/師大課程查詢系統.exe`
-* 執行後會在 `dist/師大課程查詢系統/user_data/` 建立/使用使用者資料。
+* `python app_main.py --smoke-test` 會在短時間內自動結束，適合做最小啟動檢查（不取代上述兩時點測試定義）。
 
-### 9.2 需要單一檔案時：onefile（便利但相依收集較敏感）
+## 9. 打包成 .exe（必填；提供可複製指令；不測試 .exe）
+
+* 打包輸出的 `.exe` 命名必須使用 workspace root(EXE_NAME) 的實際值：`師大課程查詢系統`。
+* 不測試 `.exe`；只需確保第 8 節兩時點測試通過。
+
+### 9.1 PyInstaller 指令（Windows CMD）
+
+若你使用第 7 節 A 方案，通常已包含 `pyinstaller`；否則先確保環境中已安裝：
+
+* `pip install pyinstaller` 或 `conda install -c conda-forge pyinstaller -y`
+
+打包指令：
 
 ```
 call conda.bat activate course_query
-pyinstaller --noconsole --clean --onefile --name "師大課程查詢系統" app_main.py
+pyinstaller --noconfirm --clean --onefile --windowed --name "師大課程查詢系統" app_main.py
 ```
 
-預期輸出：
+產物位置：
 
-* `dist/師大課程查詢系統.exe`
-* 執行後會在 `dist/user_data/` 建立/使用使用者資料。
-
----
+* 預期輸出：`dist/師大課程查詢系統.exe`
+* 打包後執行時，`user_data/` 會以 `.exe` 同層作為根目錄，建議把課程 Excel 放在：`dist/user_data/course_inputs/`。
 
 ## 10. 使用者要求（必填；長期約束；需持續維護）
 
-* 全專案（包含 README）採用繁體中文（除非另有明確要求）。
-* 主要執行環境為 Windows 11；指令以 Windows CMD 風格呈現。
-* 安裝以 Conda 為主（優先 conda-forge）；僅在 conda 不可行或相依解衝突時使用 pip。
-* `app_main.py` 為唯一入口點；README 與文件不可引導使用者以其他檔案作為入口。
-* `workspace root(EXE_NAME)` 必須維持為 `師大課程查詢系統`，並作為 PyInstaller 的 `--name`。
-* 所有可變資料必須落地在 `user_data/`（包含輸入課程檔副本、使用者歷史、最佳方案與快取）。
-* `user_data/course_inputs/` 為課程 Excel 的唯一放置位置；「開啟課程 Excel」必須複製至此再讀取。
-* 使用者資料檔案格式需向後相容（至少相容舊檔缺少 `鎖定` 欄位的情形）。
-* `dist/`、`build/`、`user_data/` 的實際內容不應提交到 Git（可提交 `.gitkeep` 保留空資料夾結構）。
+* 所有輸入／輸出／設定預設放在 `user_data/`（包含課程 Excel、使用者檔案、最佳選課輸出與快取）。
+* 測試與執行以 `python app_main.py` 為唯一入口。
+* 打包 `.exe` 名稱必須為 `師大課程查詢系統.exe`（PyInstaller `--name` 使用 `師大課程查詢系統`）。
+* 安裝與相依管理以 conda 為優先；僅在 conda 不可行/相容性因素時才使用 pip。
 
----
+## 11. GitHub操作指令（必填；必須置於 README.md 最後面；內容必須完全一致；凍結區塊）
 
-## 11. GitHub 操作
-
-以下指令以 Windows CMD 為預設；請在專案根目錄（`師大課程查詢系統/`）執行。
-
-### 11.1 初始化
+# 初始化
 
 ```
-git config --global user.name "peicd100"
-git config --global user.email "peicd100@gmail.com"
-
+(
+echo.
+echo # ignore build outputs
+echo dist/
+echo build/
+)>> .gitignore
 git init
-git add .
-git commit -m "PEICD100"
 git branch -M main
 git remote add origin https://github.com/peicd100/course_query.git
+git add .
+git commit -m "PEICD100"
 git push -u origin main
 ```
 
-### 11.2 例行上傳
+# 例行上傳
 
 ```
 git add .
@@ -296,13 +244,13 @@ git commit -m "PEICD100"
 git push -u origin main
 ```
 
-### 11.3 還原成 GitHub 最新資料
+# 還原成Git Hub最新資料
 
 ```
 git rebase --abort || echo "No rebase in progress" && git fetch origin && git switch main && git reset --hard origin/main && git clean -fd && git status
 ```
 
-### 11.4 查看儲存庫
+# 查看儲存庫
 
 ```
 git remote -v
