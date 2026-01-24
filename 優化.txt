@@ -1,0 +1,423 @@
+請閱讀PEICD100\AGENTS.md
+ENV_NAME：ntnu_course_query
+請你參考：「# 效能優化清單（文件協作｜不更改使用體驗｜完整版本）
+
+> 目標：在不改變 UI/操作流程與輸出結果的前提下，降低延遲、減少卡頓、縮短「最佳選課」計算時間、降低記憶體尖峰。
+
+## 協作規則
+
+* 每個項目都有：**現況成本 → 作法 → 預期效益 → 風險/驗證**。
+* 優先等級：
+
+  * **P0**：高頻路徑、低風險、立即收益
+  * **P1**：中等改動、收益明顯
+  * **P2**：架構性改良或需較多測試
+* 「不更改使用體驗」定義：
+
+  * 相同輸入條件下，搜尋結果列數、排序、每列顯示字串一致。
+  * 課表格子文字/顏色/衝堂提示一致。
+  * 最佳選課前 5 筆結果（含同分 tie-break）一致。
+
+---
+
+## 1. 目前可見的主要瓶頸（依互動頻率）
+
+1. 搜尋/篩選（app_mainwindow.py::MainWindow.on_search）
+
+   * 多次 `str.contains`、多次產生 numpy mask。
+   * `ck_exclude_selected` 會把 `included_ids` 轉成 list/array 後再 `np.isin`。
+   * `ck_exclude_conflict` 會呼叫 `occupied_masks_sorted`，其內部用 `np.isin` 掃全表。
+   * 最後 `filtered_df = df.loc[mask, cols]` 產生新 DataFrame，再 `ResultsModel.set_df()` Reset。
+
+2. 課表渲染（app_mainwindow.py::_render_timetable / _apply_timetable_background）
+
+   * 每次刷新都建立所有 `QTableWidgetItem`。
+   * `_apply_timetable_background` 內迴圈反覆建立 `QBrush/QColor`。
+   * baseline diff（removed_slots）仍以 `PERIODS.index(per)` 查 row。
+
+3. 課表矩陣生成（app_timetable_logic.py::build_timetable_matrix_per_day_lanes_sorted）
+
+   * 每個 slot 用 `PERIODS.index(per)`（線性查找）而非 `PERIOD_INDEX[per]`。
+   * 每次生成都做 `strip_bracket_text_for_timetable` 與 label 字串拼接。
+   * `_subset_courses_by_ids` 以 `np.isin(cid_arr, ids)` 掃全表。
+
+4. 結果表格 Model（app_widgets.py::ResultsModel）
+
+   * `_course_id_at_row` 走 `self._df.iloc[row]["開課序號"]`（每次點擊/排序/繪製都可能大量呼叫）。
+
+5. 最佳選課（app_workers.py::BestScheduleWorker._compute_best_combinations）
+
+   * `enumerate_half` 每加入一門課就 `snapshot = list(results.items())` 造成大量複製。
+   * `_HalfEntry.ids = entry.ids + (cid,)` 產生大量 tuple。
+   * better_entry tie-break 會排序 order_key（在大量碰撞時成本上升）。
+
+6. 讀寫 Excel（app_excel.py / app_user_data.py）
+
+   * `load_courses_auto` 會對多個 sheet 做 `pd.read_excel`（可能讀很多次）。
+   * `save_user_file` 子集合用 `.tolist()` + list comprehension 再 `isin` 掃全 df。
+
+---
+
+## 2. 量測與基準（先做，避免優化無法驗證）
+
+### A-01（P0）加上高頻路徑的計時與統計（可用簡單裝飾器）
+
+* 現況成本：只能靠體感；不同資料檔差異大。
+* 作法：在以下點加計時（平均/最大/呼叫次數）：
+
+  * `MainWindow.on_search`（整體）
+  * `occupied_masks_sorted`（整體）
+  * `MainWindow._render_timetable`（整體）
+  * `build_timetable_matrix_per_day_lanes_sorted`（整體）
+  * `BestScheduleWorker._compute_best_combinations`（整體、以及 enumerate_half）
+* 預期效益：明確知道 P0 是否達成。
+* 風險/驗證：僅在 debug 模式啟用，release 關閉，不影響 UX。
+
+### A-02（P0）建立可重現基準資料與操作序列
+
+* 作法：固定 3 份資料規模（例如 3k/8k/15k rows），固定操作序列：
+
+  * 搜尋框連續輸入 10 次（含刪字）
+  * 勾選/取消特殊篩選 10 次
+  * 拖曳時間格 5 次
+  * 切換顯示欄/顯示 TBA 5 次
+  * 跑一次最佳選課
+* 驗證：每個 commit 以同序列對比。
+
+---
+
+## 3. 搜尋/篩選（MainWindow.on_search）
+
+### B-01（P0）將「排除衝堂」已佔用遮罩改為快取，只在 included 變動時重算
+
+* 現況成本：`ck_exclude_conflict` 每次 on_search 都呼叫 `occupied_masks_sorted(...)`，其內部會掃全 df。
+* 作法：
+
+  1. 在 MainWindow 加：
+
+     * `_occ_lo/_occ_hi`（np.uint64）
+     * `_occ_cache_key`（例如 included_ids 的版本號或 `hash(tuple(included_sorted))`）
+  2. 只要 included_ids 有變（新增/移除/鎖定變動）就更新快取；on_search 僅讀快取。
+* 預期效益：拖曳時間格/鍵入搜尋時減少大量 O(n) 掃描。
+* 風險/驗證：
+
+  * 必須確保任何會改變 included 的路徑都會更新 key/dirty。
+  * 回歸：同一 included set 下，排除衝堂結果不變。
+
+### B-02（P0）`ck_exclude_selected` 不要每次 `np.array(list(self.included_ids))`
+
+* 現況成本：每次 on_search 都將 set 轉 list 再轉 array（高頻配置）。
+* 作法：沿用你已存在的 `_get_included_sorted()`（或新增 `_included_arr_cache`），直接 `np.isin(cid_arr, included_sorted)`。
+* 預期效益：減少配置，鍵入時更順。
+* 風險/驗證：排序不重要（isin 不看順序），結果一致。
+
+### B-03（P0）避免每次搜尋建立新 DataFrame（`df.loc[mask, cols]`）
+
+* 現況成本：DataFrame slicing + copy + Model reset 為 UI 卡頓主因之一。
+* 作法（二選一，皆不改 UX）：
+
+  1. **Row-index mapping**：
+
+     * Model 持有「原始 df」與 `visible_rows: np.ndarray[int32]`。
+     * `rowCount` 回傳 visible_rows 長度；`data()` 以 `src = visible_rows[r]` 取原 df。
+     * 搜尋只更新 visible_rows（不產生新 df）。
+  2. **Proxy filter（QSortFilterProxyModel）**：
+
+     * Model 永遠是原 df；MainWindow 維護 `mask: np.ndarray[bool]`。
+     * Proxy 的 `filterAcceptsRow` O(1) 查 `mask[source_row]`。
+     * 搜尋後只 `invalidateFilter()`。
+* 預期效益：大幅降低卡頓與記憶體尖峰。
+* 風險/驗證：
+
+  * 與排序互動需仔細測：若 proxy 有 sorting，映射要一致。
+  * 回歸：相同條件下結果列數/排序一致。
+
+### B-04（P0）通識核心篩選：移除逐列 Python 迴圈，改 bitmask/布林欄位
+
+* 現況成本：`_gened_cats` 是 list 結構，若用 list comprehension 會逐列 Python。
+* 作法：在載入 Excel（_build_courses_df_from_raw）階段把 `_gened_cats` 轉成：
+
+  * `uint16/uint32` 位元遮罩（每個核心一個 bit），或
+  * `_gened_core_<name>` 布林欄位（直接篩選）。
+* 預期效益：向量化篩選，速度更穩。
+* 風險/驗證：核心判斷語意必須與原始 `parse_gened_categories_from_course_name` 一致。
+
+### B-05（P0）`special_teaching`、`not_full` 等條件改為「載入期預先布林欄位」
+
+* 現況成本：on_search 內仍有 `.astype(str).str.contains(...)` 等處理。
+* 作法：在載入期新增：
+
+  * `_is_teaching`：`中文課程名稱` 是否含 TEACHING_NAME_TOKEN
+  * `_not_full`：`選修人數 < 限修人數`（兩者 notna 才算）
+  * `_is_sport`：`系所 == SPORT_DEPT_NAME`（你已經有 dept arr；可直接布林化）
+* 預期效益：on_search 變成純布林 AND。
+* 風險/驗證：數值欄 NaN 處理需一致。
+
+### B-06（P1）全文搜尋 token 的 contains：減少 to_numpy 次數與重複中介物
+
+* 作法：
+
+  * 儘量在載入期保證 `_alltext` 為小寫字串。
+  * on_search 內 tokens 迴圈可在 pandas 端累積後一次 `.to_numpy()`（或轉為 numpy string array 再用向量化，但需量測）。
+* 風險：pandas 字串操作本身也重；需以基準測量。
+
+### B-07（P1）搜尋簽名快取（避免 UI 重複觸發造成重算）
+
+* 作法：用 `signature = (full, serial, code_q, ...checkbox states..., sel_lo, sel_hi, match_mode)`；若與上次相同直接 return。
+* 效益：防抖之外的「重入」減少。
+
+---
+
+## 4. 結果表格 Model（app_widgets.py::ResultsModel）
+
+### C-01（P0）快取 `開課序號` 的 numpy array，避免每次 `_course_id_at_row` 走 pandas
+
+* 現況成本：`_course_id_at_row` 用 `self._df.iloc[row]["開課序號"]`。
+* 作法：
+
+  * `set_df` 時建立 `self._cid_col = self._df["開課序號"].to_numpy(...)`（或如果已是 int/cid4 string，統一轉 int array）。
+  * `_course_id_at_row(row)` 直接 O(1) array 取值。
+* 預期效益：大量繪製/排序/捲動時更順。
+* 風險/驗證：確保「開課序號」欄位型別一致（字串四碼也要能 int）。
+
+### C-02（P0）同理快取常用顯示欄位的 array（可選）
+
+* 作法：把 display 欄位對應的 numpy array 存起來，data() 用 array 取值。
+* 效益：進一步壓低 pandas 存取。
+
+### C-03（P1）若採 B-03 的 row-index mapping：ResultsModel 的 `set_df` 改為 `set_visible_rows`
+
+* 作法：避免 beginResetModel/endResetModel 大範圍 reset；採 layoutChanged 或更小的訊號。
+* 風險：Qt view 更新邏輯需測。
+
+---
+
+## 5. 課表矩陣生成（app_timetable_logic.py）
+
+### D-01（P0）用 `PERIOD_INDEX[per]` 取代 `PERIODS.index(per)`
+
+* 現況成本：每 slot 仍做線性搜尋。
+* 作法：`r = PERIOD_INDEX[per]`。
+* 效益：小改但零風險，屬於必做。
+
+### D-02（P0）課表 label（去括號+補四碼）改成載入期預先欄位
+
+* 現況成本：每次 build matrix 都 `strip_bracket_text_for_timetable` + f-string。
+* 作法：Excel 載入時新增 `_tt_label = strip(中文課名)+"
+  "+cid4`；矩陣生成直接取。
+* 效益：把 regex 與字串拼接移出高頻。
+
+### D-03（P1）`_subset_courses_by_ids` 從 O(n) 掃描改為 O(k) 直接索引
+
+* 現況：以 `np.isin(cid_arr, ids)` 掃全 df。
+* 作法（擇一）：
+
+  1. 建立 `df_by_cid = df.set_index("_cid", drop=False)`，子集合用 `df_by_cid.loc[ids]`。
+  2. 建立 `cid→rowpos` dict/array（若 cid 連續可用 array），子集合用 `iloc[rowpos_list]`。
+* 效益：occupied mask、lane assignment、matrix 生成都更快。
+* 風險：ids 可能含不存在者；需安全處理。
+
+### D-04（P1）lane assignment 避免 `rows = list(itertuples)` 的大配置（視資料量決定）
+
+* 作法：如採 D-03 的 O(k) 索引，仍需依 slots 數排序；可改為提取 `(cid, slots_len, slots_set)` 的輕量結構，減少 tuple/列物件。
+
+---
+
+## 6. 課表渲染（app_mainwindow.py::_render_timetable / _apply_timetable_background）
+
+### E-01（P0）不重建 QTableWidgetItem：初始化一次，刷新只 setText
+
+* 現況成本：每次刷新都 `QTableWidgetItem(matrix[r][c])` + setItem。
+* 作法：
+
+  * 每次行列變動（rowCount/colCount 改變）時才補齊 item；否則沿用既有 item。
+  * 在刷新大量格子前 `widget.setUpdatesEnabled(False)`，完成後 True。
+* 效益：通常是 UI 卡頓最主要來源之一。
+* 風險/驗證：
+
+  * 行列變動（lane 改變、show_days 改變）時需確保補齊。
+  * 回歸：格子文字、不可編輯、對齊方式一致。
+
+### E-02（P0）brush/color 快取：避免迴圈內重複建立 QBrush/QColor
+
+* 現況成本：`it.setForeground(QBrush(QColor("#000000")))`、`it.setBackground(QBrush(base))` 在迴圈內大量 new。
+* 作法：
+
+  * black_bg、white_fg、added_brush、added_fg、deleted_brush、black_fg 等設為成員快取。
+  * base/darker 的 brush 在每欄外先建立（例如 `base_brush = QBrush(base)`）。
+* 效益：降低大量物件配置。
+
+### E-03（P0）`removed_slots` 的 row_idx 用 `PERIOD_INDEX`，避免 try/except 與線性搜尋
+
+* 作法：`row_idx = PERIOD_INDEX.get(per)`；None 則 continue。
+* 效益：低風險小加速。
+
+### E-04（P0）slot_map 的建立不要掃 id_matrix：直接用 `_slots_by_cid` 收集
+
+* 現況：_render_timetable 會雙層掃描表格來 build slot_map。
+* 作法：
+
+  * 用 `_collect_slots_for_ids(set(included_sorted))` 直接取出 slots（你已有此函式）。
+  * 若需要排除空格判斷（deleted_cells 用），可另保留 slot_map 的 day/per 即可。
+* 效益：當欄數變大時更穩。
+
+### E-05（P1）若要極致流暢：改用 QTableView + Model（但仍不改 UX）
+
+* 說明：QTableWidget 在大量更新時天生較慢；若將課表改為 model/view 架構，能顯著降低重繪成本。
+* 風險：改動範圍大，列為 P1/P2 視資源安排。
+
+---
+
+## 7. occupied mask / lane assignment 的向量化與快取（跨模組）
+
+### F-01（P0）occupied_masks_sorted 支援「對已排序 cid array 做 searchsorted」避免掃全 df
+
+* 觀察：MainWindow._compute_total_credits 已有 `_cid_sorted` + `np.searchsorted` 快路徑。
+* 作法：同理維護 `_mask_lo_sorted/_mask_hi_sorted`；對 included_sorted 用 searchsorted 取位置，再 reduce。
+* 效益：排除衝堂即使不快取，也會比掃全 df 快。
+* 風險：需保證 `_cid_sorted` 與 mask arrays 同步。
+
+### F-02（P1）build_lane_assignment_sorted 的子集合取得改為 O(k)（承接 D-03）
+
+* 作法：避免 `_subset_courses_by_ids` 掃全 df。
+
+---
+
+## 8. 最佳選課（app_workers.py::BestScheduleWorker）
+
+### G-01（P0）半邊枚舉：移除 `snapshot = list(results.items())`
+
+* 現況成本：每輪複製整個 results，隨結果膨脹會劇烈變慢與吃記憶體。
+* 作法（維持同結果）：
+
+  * 以「平行 list」儲存狀態，並用 dict 記錄 mask→最佳 entry index：
+
+    * `masks: list[int]`
+    * `credit: list[float]`
+    * `priority_sum: list[int]`
+    * `gened: list[int]`
+    * `parent: list[int]`、`last_cid: list[int]`（回溯用）
+  * 每處理一個 item，只迭代 `0..cur_len-1` 的既有 entries，再 append 新 entry（不需要 snapshot）。
+* 預期效益：通常是最佳選課最大加速點。
+* 風險/驗證：
+
+  * better_entry 的比較規則要完全一致（credit、priority_sum、order_key）。
+  * 回歸：同輸入下 top5 完全一致。
+
+### G-02（P0）降低 entry 物件數：_HalfEntry 改 **slots** 或改用 tuple/array
+
+* 現況成本：dataclass(frozen=True) 仍會產生大量 Python 物件；且 ids tuple 會爆。
+* 作法：
+
+  * 若仍用物件：**slots** + 不存 ids（改 parent pointer）。
+  * 更佳：完全不用物件，改平行 list。
+
+### G-03（P1）ids 改為 parent-pointer 回溯，避免 `entry.ids + (cid,)`
+
+* 作法：
+
+  * 每個 entry 存 parent index 與 last_cid。
+  * 在產出 best 結果時才回溯重建 ids list。
+* 效益：大幅降低 tuple 配置。
+
+### G-04（P1）tie-break（order_key）只在必要時生成/比較
+
+* 現況：better_entry 對等分時會做 `sorted(order_map.get(...) for cid in ids)`。
+* 作法：
+
+  * 維持完全一致結果的前提下，可延遲計算：僅在 credit 與 priority_sum 完全相等時才生成 order_key。
+  * 若 parent-pointer：生成 order_key 時走回溯拿 ids。
+
+### G-05（P1）候選項目先依 mask 去重（同時段只留更佳者）
+
+* 說明：相同 mask 的課程不可同時選，保留劣解只會放大枚舉空間。
+* 作法：在 items 建立後先 `best_by_mask[mask] = best_item`（以 credit 高優先、priority_sum 低次之、cid/order 其後）。
+* 效益：n 降低會帶來指數級效益。
+* 風險：比較規則需與全域一致，確保不會錯刪會進入 top5 的候選。
+
+### G-06（P2）改用 branch-and-bound / beam search（仍保持 top5 完全一致需謹慎）
+
+* 若要保證一致性，剪枝必須是「安全上界」；工程成本較高，列為 P2。
+
+---
+
+## 9. Excel 載入（app_excel.py）
+
+### H-01（P1）避免對每個 sheet 都完整 `pd.read_excel`：先讀 header 判斷必要欄位
+
+* 現況：load_courses_auto 會對 ordered sheets 嘗試 `pd.read_excel(excel_path, sheet_name=s)`。
+* 作法：
+
+  1. `pd.ExcelFile(excel_path).sheet_names` 取得名稱。
+  2. 對每張 sheet 先 `pd.read_excel(..., nrows=0)` 只讀欄名，確認 REQUIRED_COLUMNS。
+  3. 只對符合者再讀完整內容並做 cnt 比較。
+* 效益：大型 Excel 或多 sheet 時載入時間大降。
+* 風險：部分 Excel 欄名列不在第一列時可能失敗；需維持與現有同容錯。
+
+### H-02（P1）`load_workbook` 只為判斷 sheetnames：可改 read_only=True（若相容）
+
+* 目前 ensure_excel_readable 用 openpyxl 讀 Workbook。
+* 若只需要 sheetnames/可讀性檢查，read_only=True 可能更省記憶體。
+
+### H-03（P1）預先產生更多內部欄位以加速後續篩選
+
+* 已有：`_code_lc/_cname_lc/_teacher_lc/_dept_lc/_alltext/_mask_lo/_mask_hi/_slots_set/_tba/_gened_cats`。
+* 建議再加：
+
+  * `_tt_label`（課表顯示用）
+  * `_is_teaching/_is_sport/_not_full`（篩選用）
+  * `_gened_mask`（核心 bitmask）
+
+---
+
+## 10. 存檔/讀檔（app_user_data.py）
+
+### I-01（P0/P1）save_user_file：移除 `.tolist()` + list comprehension
+
+* 現況：`courses_df[courses_df["_cid"].isin([int(x) for x in included_ids_sorted.tolist()])].copy()`
+* 作法：
+
+  * 直接 `isin(included_ids_sorted)`（numpy array 可直接用）。
+  * 或更佳：若採 D-03 的 df_by_cid，直接 `df_by_cid.loc[included_ids_sorted]`。
+* 效益：存檔更快且少配置。
+
+### I-02（P1）openpyxl 寫入：大量寫入可用 write_only 模式（若你能接受）
+
+* 說明：write_only 會限制部分讀取操作，但 save_user_file 是純輸出，非常適合。
+* 效益：更省記憶體、寫檔更快。
+
+### I-03（P2）原子寫入（temp→replace）
+
+* 效益：避免中途寫入失敗造成壞檔；不影響 UX。
+
+---
+
+## 11. 低風險微優化（P0）
+
+* J-01：所有 `PERIODS.index(...)` 可改 `PERIOD_INDEX[...]`（課表矩陣與 removed_slots）
+* J-02：在大量更新 UI 之前統一 `setUpdatesEnabled(False)` + `QSignalBlocker`（避免多次重繪）
+* J-03：熱路徑內把常用屬性（df/arrays/checkbox state）存成 local 變數，減少 attribute lookup
+
+---
+
+## 12. 建議落地順序（最小風險、最大體感）
+
+1. P0：B-01（排除衝堂遮罩快取）＋ B-02（exclude_selected 少配置）
+2. P0：E-01（課表 item 重用）＋ E-02（brush 快取）＋ E-03（PERIOD_INDEX）
+3. P0：D-01（PERIOD_INDEX）＋ D-02（_tt_label 載入期）
+4. P0：C-01（ResultsModel 快取開課序號）
+5. P0：G-01/G-02（最佳選課 enumerate_half 移除 snapshot/減物件）
+6. P1：B-03（不產生 filtered_df；改 row-index mapping 或 proxy filter）
+7. P1：D-03/F-01（O(k) 子集合與 mask searchsorted）
+8. P1：H-01（Excel 多 sheet header 探測）
+
+---
+
+## 13. 回歸測試清單（確保體驗不變）
+
+* 搜尋：相同條件（含多 token）下，列數與排序一致。
+* 排除已選：included_ids 變動後結果一致。
+* 排除衝堂：相同 included_ids 下結果一致（含 TBA 邏輯）。
+* 課表：同 included/locked 下格子文字、黑底白字鎖定、added/deleted 色塊一致。
+* 最佳選課：相同 favorites/locked/included/fav_seq 下 top5 檔名與內容一致。
+* 存檔：輸出 Excel 的「我的最愛」與「課表匯出」內容一致。」看哪些是可行的優化，直接幫我改

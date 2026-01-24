@@ -42,6 +42,7 @@
 1.4 禁止改系統設定 / 全域設定
 - 嚴禁任何系統或全域設定修改（PATH、永久環境變數、ExecutionPolicy、登錄檔、需要管理員權限的設定、全域安裝程式）。
 - 只能使用 Anaconda/Conda 管理環境。
+- 例外釐清（硬性）：若你使用 `VsDevCmd.bat`，其作用僅限於「當前 CMD session」的臨時環境變數設定，非永久系統修改；但你仍不得指示或要求任何永久變更（例如修改 PATH/登錄檔/系統環境變數）。
 
 1.5 禁止無效重試
 - 禁止在受限環境中反覆重試同一件必然失敗的事。
@@ -132,7 +133,7 @@
 (9) 測試方式
 (10) 打包成 .exe（必填；提供可複製指令）
     - 需要提供無安裝環境，點下 .exe 依然能執行的打包方式
-    - 打包指令必須包含 `-y`（硬性），用於非互動覆寫確認。
+    - 若採用 PyInstaller：打包指令必須包含 `-y`（硬性），用於非互動覆寫確認。
 (11) 使用者要求（必填；長期約束；需持續維護）
 (12) GitHub操作指令（必填；必須置於 README.md 最後面；凍結區塊）
 
@@ -343,11 +344,25 @@
 - 嚴禁使用非 conda env 的 python 做 pip install。
 - 禁止使用其他環境管理工具（venv/poetry/uv/rye/pyenv 等）。
 
-5.2 conda 進入方式（硬性規定）
+5.2 conda 進入方式（硬性規定；Windows CMD）
+5.2.1 一般（Python 或不需要 MSVC 的情境）
 - cmd + activate.bat：
   call "C:\ProgramData\Anaconda3\Scripts\activate.bat" "C:\ProgramData\Anaconda3"
   conda activate base
   conda activate <ENV_PATH 或 ENV_NAME>
+
+5.2.2 C++（建議；使用 MSVC/VS Build Tools 時）
+- 若專案涉及 C/C++ 並使用 MSVC 工具鏈，優先建議先進入 VS Developer Command Prompt 環境，再進入 conda（同一個 CMD session）：
+  call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+  call "C:\ProgramData\Anaconda3\Scripts\activate.bat" "C:\ProgramData\Anaconda3"
+  conda activate base
+  conda activate <ENV_PATH 或 ENV_NAME>
+
+路徑存在性規則（硬性）：
+- 若上述 VsDevCmd.bat 路徑不存在或無法執行：
+  - 你必須停止使用其他版本/其他路徑的猜測
+  - 並向使用者索取其實際可用的 VsDevCmd.bat 路徑或其 VS/Build Tools 安裝證據
+- 你不得要求或指示修改系統 PATH、登錄檔或任何全域設定（見 1.4）。
 
 5.3 環境驗證（硬性規定）
 - 證據必須來自 python：
@@ -358,10 +373,13 @@
   - 你必須停止所有需要環境正確性的行為（安裝/打包/產生鎖定檔/測試等）
   - 並在對話回覆清楚說明限制與影響
 
-5.4 工具鏈一律 Conda 化（硬性；含 C/C++）
-- 無論專案語言為何，凡涉及依賴/工具鏈（包含 Python 套件、CMake、Ninja、編譯器等）均必須以 conda 安裝並使用於 ENV_NAME 環境內。
-- 禁止改用系統層安裝器、全域安裝、或透過修改 PATH 等方式繞過 conda。
-- 若受限於環境導致無法在 conda 內取得必要工具鏈：必須停止並回報限制與替代方案（由使用者自行處理系統層安裝/設定）。
+5.4 工具鏈 Conda 優先（硬性；含 C/C++）
+- 無論專案語言為何，凡涉及依賴與常用建置工具（包含 Python 套件、CMake、Ninja、常用庫依賴等）均必須優先以 conda 安裝並使用於 ENV_NAME 環境內。
+- 允許例外（硬性；C++/MSVC）：
+  - 若使用 MSVC/VS Build Tools 作為編譯器工具鏈，允許由 `VsDevCmd.bat` 提供（見 5.2.2）。
+  - 此例外僅限於「編譯器工具鏈」本身；其餘可 conda 化之工具與依賴仍必須優先 conda 化。
+- 禁止用修改系統 PATH 等永久方式繞過 conda（見 1.4）。
+- 若受限於環境導致無法在 conda 內取得必要工具/依賴：必須停止並回報限制與替代方案（由使用者自行處理系統層安裝/設定）。
 
 ================================================================================
 6. 硬體規格（供效能取捨參考）
