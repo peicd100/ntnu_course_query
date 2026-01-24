@@ -16,6 +16,8 @@
     *   實作 **簽名快取 (Signature Cache)**，避免重複運算。
     *   **向量化篩選**：將通識、滿額等條件改為預先計算的布林/位元遮罩。
     *   **稀疏矩陣優化**：針對文字搜尋（課名/教師）實作子集掃描策略。
+    *   **搜尋記憶體優化**：在子集搜尋時僅切片所需欄位，避免複製 DataFrame。
+    *   **結果列表快取優化**：避免在搜尋時重複建立欄位快取 (Column Cache)，僅更新索引。
     *   **ID 查找優化**：使用 `searchsorted` (O(k log n)) 取代 `isin`。
 *   **零複製 (Zero-Copy)**：搜尋結果改用 Row-index mapping，不再複製 DataFrame，降低記憶體壓力。
 *   **最佳選課演算法**：
@@ -23,11 +25,13 @@
     *   實作 **Mask 去重 (Pruning)**，提早排除劣解。
 *   **UI 渲染**：
     *   課表繪製重用 `QTableWidgetItem` 與快取 Brush/Color。
+    *   **重繪優化**：課表更新時檢查顏色狀態，避免不必要的 `setBackground` 呼叫。
     *   結果列表使用 Numpy Array 快取欄位資料。
     *   **渲染資源預計算**：預先建立課表背景 Brush，減少重繪時的物件建立。
     *   **工具函式快取**：`slot_to_mask` 加入 LRU Cache，加速 Excel 載入與遮罩計算。
 *   **資料 I/O**：
     *   Excel 載入優化（Header 預讀）。
+    *   **向量化資料解析**：在 Excel 載入階段，使用向量化操作取代 `apply`，加速開課序號的解析與格式化。
     *   存檔使用 `write_only` 模式與 **原子寫入 (Atomic Save)**。
 
 ### 2. 新增功能 (New Features)

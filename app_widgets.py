@@ -457,31 +457,42 @@ class ResultsModel(QAbstractTableModel):
     def set_data_view(self, source_df: pd.DataFrame, visible_rows: Optional[np.ndarray] = None, display_cols: Optional[List[str]] = None) -> None:
         # B-03: Update view without resetting model if possible, or use layoutChanged
         self.layoutAboutToBeChanged.emit()
-        
-        self._source_df = source_df
-        
+
+        cache_dirty = False
+
+        if self._source_df is not source_df:
+            self._source_df = source_df
+            cache_dirty = True
+
+        if display_cols is not None:
+            if display_cols != self._display_columns:
+                self._display_columns = display_cols
+                cache_dirty = True
+        else:
+            # If display_cols is None, we default to all non-internal columns
+            new_cols = [c for c in source_df.columns if not str(c).startswith("_")]
+            if new_cols != self._display_columns:
+                self._display_columns = new_cols
+                cache_dirty = True
+
         if visible_rows is not None:
             self._visible_rows = visible_rows
         else:
             self._visible_rows = np.arange(len(source_df), dtype=np.int32)
-            
-        if display_cols is not None:
-            self._display_columns = display_cols
-        else:
-            self._display_columns = [c for c in source_df.columns if not str(c).startswith("_")]
 
-        # C-02: Cache all display columns as numpy arrays for O(1) access
-        self._col_arrays = []
-        for col in self._display_columns:
-            self._col_arrays.append(self._source_df[col].to_numpy(copy=False))
+        if cache_dirty:
+            # C-02: Cache all display columns as numpy arrays for O(1) access
+            self._col_arrays = []
+            for col in self._display_columns:
+                self._col_arrays.append(self._source_df[col].to_numpy(copy=False))
 
-        # C-01: Cache cid column from source directly (it's immutable usually)
-        # We use _cid (int) for faster lookup if available
-        if "_cid" in self._source_df.columns:
-            self._cid_col = self._source_df["_cid"].to_numpy(dtype=np.int64, copy=False)
-        else:
-            self._cid_col = None
-            
+            # C-01: Cache cid column from source directly (it's immutable usually)
+            # We use _cid (int) for faster lookup if available
+            if "_cid" in self._source_df.columns:
+                self._cid_col = self._source_df["_cid"].to_numpy(dtype=np.int64, copy=False)
+            else:
+                self._cid_col = None
+
         self.layoutChanged.emit()
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:

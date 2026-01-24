@@ -120,10 +120,18 @@ def _build_courses_df_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
     df = raw.copy()
 
-    cid_series = df["開課序號"].apply(parse_cid_to_int)
+    # Vectorized version of parse_cid_to_int for performance
+    cid_series = pd.to_numeric(df["開課序號"].astype(str).str.extract(r'(\d+)', expand=False), errors='coerce')
+
     df = df[cid_series.notna()].copy()
     df["_cid"] = cid_series.loc[df.index].astype(int)
-    df["開課序號"] = df["_cid"].apply(format_cid4)
+
+    # Vectorized version of format_cid4 for performance
+    cids = df["_cid"]
+    cids_str = cids.astype(str)
+    df["開課序號"] = np.where(
+        (cids >= 0) & (cids < 10000), cids_str.str.zfill(4), cids_str
+    )
 
     for col in ["開課代碼", "系所", "中文課程名稱", "教師", "必/選", "全/半", "地點時間"]:
         if col in df.columns:

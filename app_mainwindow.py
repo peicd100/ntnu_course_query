@@ -218,6 +218,7 @@ class MainWindow(QMainWindow):
         self._brush_cache_darker: List[QBrush] = []
 
         self._cid_sorted: Optional[np.ndarray] = None
+        self._splitter_state_backup: Optional[Dict[str, List[int]]] = None
         self._name_sorted: Optional[np.ndarray] = None
         self._teacher_sorted: Optional[np.ndarray] = None
         self._credit_sorted: Optional[np.ndarray] = None
@@ -780,6 +781,16 @@ class MainWindow(QMainWindow):
     def _set_history_mode_layout(self, active: bool) -> None:
         if active == self._history_layout_active:
             return
+        
+        if active:
+            # Backup current sizes before entering history mode
+            self._splitter_state_backup = {
+                "main": self.split_main.sizes(),
+                "left_v": self.split_left_v.sizes(),
+                "left_top": self.split_left_top.sizes(),
+                "tt": self.tt_splitter.sizes(),
+            }
+
         self._history_layout_active = active
         self.gb_filters.setVisible(not active)
         self.gb_results.setVisible(not active)
@@ -803,13 +814,19 @@ class MainWindow(QMainWindow):
             if hasattr(self, "tt_splitter"):
                 self.tt_splitter.setSizes([1, 1])
         else:
-            self.split_main.setSizes([1, 1])
-            if hasattr(self, "split_left_top"):
-                self.split_left_top.setSizes([1, 1])
-            if hasattr(self, "split_left_v"):
-                self.split_left_v.setSizes([1, 1])
-            if hasattr(self, "tt_splitter"):
-                self.tt_splitter.setSizes([1, 0])
+            if self._splitter_state_backup:
+                self.split_main.setSizes(self._splitter_state_backup.get("main", [1, 1]))
+                self.split_left_v.setSizes(self._splitter_state_backup.get("left_v", [1, 1]))
+                self.split_left_top.setSizes(self._splitter_state_backup.get("left_top", [1, 1]))
+                self.tt_splitter.setSizes(self._splitter_state_backup.get("tt", [1, 0]))
+            else:
+                self.split_main.setSizes([1, 1])
+                if hasattr(self, "split_left_top"):
+                    self.split_left_top.setSizes([1, 1])
+                if hasattr(self, "split_left_v"):
+                    self.split_left_v.setSizes([1, 1])
+                if hasattr(self, "tt_splitter"):
+                    self.tt_splitter.setSizes([1, 0])
         self._refresh_history_preview_timetable()
 
     # ====== Excel 載入：自動找字典序最後的 xls/xlsx ======
@@ -1548,6 +1565,9 @@ class MainWindow(QMainWindow):
         self._session_seq_backup = None
         self._history_selected_file = ""
         self._set_readonly(False)
+
+        if self._history_mode:
+            self._close_history_panel()
 
         self.lbl_user.setText(f"使用者：{self.username}")
         self._set_user_file_label()
@@ -2940,21 +2960,27 @@ class MainWindow(QMainWindow):
                     locked = bool(locked_matrix[r][c])
 
                 if locked and (it.text() or "").strip():
-                    it.setBackground(black_bg)
-                    it.setForeground(white_fg)
+                    if it.background() != black_bg:
+                        it.setBackground(black_bg)
+                    if it.foreground() != white_fg:
+                        it.setForeground(white_fg)
                     prev_cid = cid
                     continue
 
                 if diff_added_cids and cid is not None and cid in diff_added_cids:
-                    it.setBackground(added_brush)
-                    it.setForeground(added_fg)
+                    if it.background() != added_brush:
+                        it.setBackground(added_brush)
+                    if it.foreground() != added_fg:
+                        it.setForeground(added_fg)
                     prev_cid = cid
                     continue
 
-                it.setForeground(black_bg)
+                if it.foreground() != black_bg:
+                    it.setForeground(black_bg)
 
                 if cid is None:
-                    it.setBackground(base_brush)
+                    if it.background() != base_brush:
+                        it.setBackground(base_brush)
                     prev_cid = None
                     continue
 
@@ -2963,7 +2989,9 @@ class MainWindow(QMainWindow):
                         course_to_shade[cid] = next_shade % 2
                         next_shade += 1
                 shade = course_to_shade.get(cid, 0)
-                it.setBackground(base_brush if shade == 0 else darker_brush)
+                bg = base_brush if shade == 0 else darker_brush
+                if it.background() != bg:
+                    it.setBackground(bg)
                 prev_cid = cid
 
         if diff_removed_cells:
@@ -2971,7 +2999,8 @@ class MainWindow(QMainWindow):
                 if 0 <= row < rows and 0 <= col < cols:
                     cell = widget.item(row, col)
                     if cell is not None:
-                        cell.setBackground(deleted_brush)
+                        if cell.background() != deleted_brush:
+                            cell.setBackground(deleted_brush)
 
     def _render_timetable(
         self,
@@ -3301,11 +3330,25 @@ class MainWindow(QMainWindow):
                 mask &= ((df["限修人數"].notna()) & (df["選修人數"].notna()) & (df["選修人數"] < df["限修人數"])).to_numpy()
 
         if self.ck_exclude_selected.isChecked():
-            if self.included_ids:
-                cid_arr = self._cid_arr if self._cid_arr is not None else df["_cid"].to_numpy(dtype=np.int64, copy=False)
-                # B-02: Use _get_included_sorted()
-                inc_sorted = self._get_included_sorted()
-                if inc_sorted.size > 0:
+            # Fix: Ensure included_ids is up-to-date (merging locked_ids) before checking size
+            inc_sorted = self._get_included_sorted()
+            if inc_sorted.size > 0:
+                if self._cid_arr is not None:
+                    # Optimization: Use searchsorted (O(k log N)) instead of isin (O(N))
+                    indices = np.searchsorted(self._cid_arr, inc_sorted)
+                    
+                    # Filter valid indices and check matches
+                    valid = (indices < len(self._cid_arr))
+                    if valid.all():
+                        matched = (self._cid_arr[indices] == inc_sorted)
+                        mask[indices[matched]] = False
+                    else:
+                        valid_indices = indices[valid]
+                        valid_inc = inc_sorted[valid]
+                        matched = (self._cid_arr[valid_indices] == valid_inc)
+                        mask[valid_indices[matched]] = False
+                else:
+                    cid_arr = df["_cid"].to_numpy(dtype=np.int64, copy=False)
                     mask &= ~np.isin(cid_arr, inc_sorted)
 
         if not self.ck_show_tba.isChecked():
@@ -3367,52 +3410,66 @@ class MainWindow(QMainWindow):
                 # If remaining rows are few, subsetting is faster than full scan
                 SUBSET_THRESHOLD = 4000 
                 
-                target_df = df
-                target_mask = mask
                 is_subset = False
                 indices = None
+                target_mask = None
 
                 if current_count < SUBSET_THRESHOLD:
                     is_subset = True
                     indices = np.flatnonzero(mask)
-                    target_df = df.iloc[indices]
                     # Create a temporary mask for the subset (all True initially)
-                    target_mask = np.ones(len(target_df), dtype=bool)
+                    target_mask = np.ones(current_count, dtype=bool)
+                else:
+                    target_mask = mask
 
                 # Helper to apply mask
                 def apply_text_mask(m):
                     nonlocal target_mask
                     target_mask &= m
 
+                def get_search_series(col_name, fallback_col=None):
+                    if col_name in df.columns:
+                        series = df[col_name]
+                    elif fallback_col and fallback_col in df.columns:
+                        series = df[fallback_col].astype(str).str.lower()
+                    else:
+                        return None
+                    
+                    if is_subset:
+                        return series.iloc[indices]
+                    return series
+
                 if full:
                     tokens = [t.strip().lower() for t in full.split() if t.strip()]
                     if tokens:
-                        s = target_df["_alltext"]
-                        for tok in tokens:
-                            apply_text_mask(s.str.contains(tok, regex=False, na=False).to_numpy())
+                        s = get_search_series("_alltext")
+                        if s is not None:
+                            for tok in tokens:
+                                apply_text_mask(s.str.contains(tok, regex=False, na=False).to_numpy())
 
-                if code_q and "開課代碼" in target_df.columns:
+                if code_q:
                     tokens = [t.strip().lower() for t in code_q.split() if t.strip()]
                     if tokens:
-                        s = target_df["_code_lc"] if "_code_lc" in target_df.columns else target_df["開課代碼"].astype(str).str.lower()
-                        for tok in tokens:
-                            apply_text_mask(s.str.contains(tok, regex=False, na=False).to_numpy())
+                        s = get_search_series("_code_lc", "開課代碼")
+                        if s is not None:
+                            for tok in tokens:
+                                apply_text_mask(s.str.contains(tok, regex=False, na=False).to_numpy())
 
-                if cname and "中文課程名稱" in target_df.columns:
+                if cname:
                     cname_lc = cname.lower()
-                    s = target_df["_cname_lc"] if "_cname_lc" in target_df.columns else target_df["中文課程名稱"].astype(str).str.lower()
-                    apply_text_mask(s.str.contains(cname_lc, regex=False, na=False).to_numpy())
+                    s = get_search_series("_cname_lc", "中文課程名稱")
+                    if s is not None:
+                        apply_text_mask(s.str.contains(cname_lc, regex=False, na=False).to_numpy())
 
-                if teacher and "教師" in target_df.columns:
+                if teacher:
                     teacher_lc = teacher.lower()
-                    s = target_df["_teacher_lc"] if "_teacher_lc" in target_df.columns else target_df["教師"].astype(str).str.lower()
-                    apply_text_mask(s.str.contains(teacher_lc, regex=False, na=False).to_numpy())
+                    s = get_search_series("_teacher_lc", "教師")
+                    if s is not None:
+                        apply_text_mask(s.str.contains(teacher_lc, regex=False, na=False).to_numpy())
 
                 if is_subset:
                     # Map subset mask back to original mask
                     mask[indices] = target_mask
-                else:
-                    mask = target_mask
 
         cols = self.display_columns if self.display_columns else [c for c in df.columns if not str(c).startswith("_")]
         
