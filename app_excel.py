@@ -122,13 +122,22 @@ def _build_courses_df_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
     for col in ["開課代碼", "系所", "中文課程名稱", "教師", "必/選", "全/半", "地點時間"]:
         if col in df.columns:
-            df[col] = df[col].astype(str).fillna("").str.strip()
+            df[col] = df[col].fillna("").astype(str).str.strip()
 
     for col in ["學分", "限修人數", "選修人數"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    parsed_results = [parse_time_text(text) for text in df["地點時間"]]
+    # Cache time parsing results to reduce repeated parsing on identical strings
+    time_cache = {}
+    parsed_results = []
+    for text in df["地點時間"]:
+        key = "" if text is None else str(text)
+        res = time_cache.get(key)
+        if res is None:
+            res = parse_time_text(text)
+            time_cache[key] = res
+        parsed_results.append(res)
     df["_slots_set"] = [res.slots for res in parsed_results]
     df["_slots"] = [sorted(res.slots, key=_slot_sort_key) for res in parsed_results]
     df["_tba"] = [res.tba for res in parsed_results]
@@ -137,10 +146,27 @@ def _build_courses_df_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
     df["_mask_lo"] = [np.uint64(t[0]) for t in masks]
     df["_mask_hi"] = [np.uint64(t[1]) for t in masks]
 
-    df["_gened_cats"] = [
-        parse_gened_categories_from_course_name(name)
-        for name in df["中文課程名稱"]
-    ]
+    # Cache gened parsing to reduce repeated regex work
+    gened_cache = {}
+    gened_results = []
+    for name in df["中文課程名稱"]:
+        key = "" if name is None else str(name)
+        res = gened_cache.get(key)
+        if res is None:
+            res = parse_gened_categories_from_course_name(name)
+            gened_cache[key] = res
+        gened_results.append(res)
+    df["_gened_cats"] = gened_results
+
+    # Precompute lowercased fields for faster search (kept as internal columns)
+    if "開課代碼" in df.columns:
+        df["_code_lc"] = df["開課代碼"].str.lower()
+    if "中文課程名稱" in df.columns:
+        df["_cname_lc"] = df["中文課程名稱"].str.lower()
+    if "教師" in df.columns:
+        df["_teacher_lc"] = df["教師"].str.lower()
+    if "系所" in df.columns:
+        df["_dept_lc"] = df["系所"].str.lower()
 
     display_cols = [c for c in df.columns if not str(c).startswith("_")]
     

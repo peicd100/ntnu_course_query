@@ -64,8 +64,18 @@ class _BestCandidate:
     mask_hi: np.uint64
 
 
+@dataclass(frozen=True)
+class _HalfEntry:
+    mask: int
+    credit: float
+    gened: int
+    ids: tuple
+    priority_sum: int
+
+
 class BestScheduleWorker(QObject, QRunnable):
     finished = Signal(int, bool, bool, list, str)
+    progress = Signal(int, int)
 
     def __init__(
         self,
@@ -93,9 +103,17 @@ class BestScheduleWorker(QObject, QRunnable):
         self.best_schedule_dir = best_schedule_dir_path(user_dir_path)
 
         self._cancel_requested = False
+        self._progress_last = -1
 
     def cancel(self) -> None:
         self._cancel_requested = True
+
+    def _emit_progress(self, value: int) -> None:
+        v = int(max(0, min(100, int(value))))
+        if v == self._progress_last:
+            return
+        self._progress_last = v
+        self.progress.emit(self.token, v)
 
     def _format_credit_text(self, value: float) -> str:
         if abs(value - round(value)) < 1e-9:
@@ -170,20 +188,83 @@ class BestScheduleWorker(QObject, QRunnable):
             return []
 
         order_map = self._build_order_map()
+        base_mask = (int(base_hi) << 64) | int(base_lo)
+
+        items = []
+        for item in cand:
+            mask = (int(item.mask_hi) << 64) | int(item.mask_lo)
+            if mask & base_mask:
+                continue
+            order_val = int(order_map.get(int(item.cid), 10**12))
+            items.append((int(item.cid), float(item.credit), int(item.gened), int(mask), order_val))
+
+        mid = len(items) // 2
+        left_items = items[:mid]
+        right_items = items[mid:]
+
+        def order_key_for_ids(ids: tuple) -> List[int]:
+            return sorted(order_map.get(int(cid), 10**12) for cid in ids)
+
+        def better_entry(a: _HalfEntry, b: _HalfEntry) -> bool:
+            if a.credit != b.credit:
+                return a.credit > b.credit
+            if a.priority_sum != b.priority_sum:
+                return a.priority_sum < b.priority_sum
+            ka = order_key_for_ids(a.ids)
+            kb = order_key_for_ids(b.ids)
+            return ka < kb
+
+        def enumerate_half(
+            items_half: List[Tuple[int, float, int, int, int]],
+            progress_start: int,
+            progress_span: int,
+        ) -> Dict[int, _HalfEntry]:
+            results: Dict[int, _HalfEntry] = {
+                0: _HalfEntry(mask=0, credit=0.0, gened=0, ids=tuple(), priority_sum=0)
+            }
+            total_items = len(items_half)
+            for idx, (cid, credit, gened, mask, order_val) in enumerate(items_half, start=1):
+                if self._cancel_requested:
+                    return {}
+                snapshot = list(results.items())
+                for mask0, entry in snapshot:
+                    if mask0 & mask:
+                        continue
+                    new_mask = mask0 | mask
+                    new_entry = _HalfEntry(
+                        mask=new_mask,
+                        credit=entry.credit + credit,
+                        gened=entry.gened + gened,
+                        ids=entry.ids + (cid,),
+                        priority_sum=entry.priority_sum + order_val,
+                    )
+                    existing = results.get(new_mask)
+                    if existing is None or better_entry(new_entry, existing):
+                        results[new_mask] = new_entry
+                if total_items > 0:
+                    pct = progress_start + int(progress_span * (idx / total_items))
+                    self._emit_progress(pct)
+            return results
+
+        left_map = enumerate_half(left_items, 0, 40)
+        if self._cancel_requested:
+            return []
+        right_map = enumerate_half(right_items, 40, 40)
+        if self._cancel_requested:
+            return []
+
+        left_list = list(left_map.values())
+        right_list = list(right_map.values())
+
+        left_list.sort(key=lambda x: -x.credit)
+        right_list.sort(key=lambda x: (-x.credit, x.priority_sum))
 
         best: List[dict] = []
-        n = len(cand)
 
-        suffix_max = [0.0] * (n + 1)
-        for i in range(n - 1, -1, -1):
-            suffix_max[i] = suffix_max[i + 1] + max(0.0, cand[i].credit)
-
-        selected: List[int] = []
-
-        def consider_result(cur_credit: float, cur_gened: int) -> None:
-            total_credit = base_credit + cur_credit
-            total_gened = base_gened + cur_gened
-            ids_all = sorted(locked_ids + selected)
+        def consider_combo(left: _HalfEntry, right: _HalfEntry) -> None:
+            total_credit = base_credit + left.credit + right.credit
+            total_gened = base_gened + left.gened + right.gened
+            ids_all = sorted(locked_ids + list(left.ids) + list(right.ids))
             order_key = sorted(order_map.get(cid, 10**12) for cid in ids_all)
             priority_sum = sum(order_key)
             entry = {
@@ -194,40 +275,36 @@ class BestScheduleWorker(QObject, QRunnable):
                 "priority_sum": priority_sum,
             }
             best.append(entry)
-            best.sort(
-                key=lambda x: (-x["credits"], x["priority_sum"], x["order_key"])
-            )
+            best.sort(key=lambda x: (-x["credits"], x["priority_sum"], x["order_key"]))
             if len(best) > 5:
                 del best[5:]
 
-        def dfs(idx: int, mask_lo: np.uint64, mask_hi: np.uint64, cur_credit: float, cur_gened: int) -> None:
-            if self._cancel_requested:
-                return
-            if idx >= n:
-                consider_result(cur_credit, cur_gened)
-                return
+        max_right_credit = right_list[0].credit if right_list else 0.0
 
+        total_pairs = len(left_list) * len(right_list)
+        step = max(1, total_pairs // 200) if total_pairs > 0 else 1
+        done_pairs = 0
+
+        for left in left_list:
+            if self._cancel_requested:
+                return []
             if len(best) == 5:
                 worst_credit = best[-1]["credits"]
-                max_possible = base_credit + cur_credit + suffix_max[idx]
-                if max_possible + 1e-9 < worst_credit:
-                    return
-
-            item = cand[idx]
-            if (mask_lo & item.mask_lo) == 0 and (mask_hi & item.mask_hi) == 0:
-                selected.append(item.cid)
-                dfs(
-                    idx + 1,
-                    mask_lo | item.mask_lo,
-                    mask_hi | item.mask_hi,
-                    cur_credit + item.credit,
-                    cur_gened + item.gened,
-                )
-                selected.pop()
-
-            dfs(idx + 1, mask_lo, mask_hi, cur_credit, cur_gened)
-
-        dfs(0, base_lo, base_hi, 0.0, 0)
+                if base_credit + left.credit + max_right_credit + 1e-9 < worst_credit:
+                    continue
+            for right in right_list:
+                if self._cancel_requested:
+                    return []
+                total_credit = base_credit + left.credit + right.credit
+                if len(best) == 5 and total_credit + 1e-9 < best[-1]["credits"]:
+                    break
+                if left.mask & right.mask:
+                    continue
+                consider_combo(left, right)
+                done_pairs += 1
+                if done_pairs % step == 0 and total_pairs > 0:
+                    pct = 80 + int(20 * done_pairs / total_pairs)
+                    self._emit_progress(pct)
 
         if not best:
             return []
@@ -289,23 +366,29 @@ class BestScheduleWorker(QObject, QRunnable):
 
     def run(self):
         try:
+            self._emit_progress(0)
             results = self._compute_best_combinations()
             if self._cancel_requested:
+                self._emit_progress(100)
                 self.finished.emit(self.token, False, True, [], "")
                 return
 
             files = self._write_results(results)
             if self._cancel_requested:
+                self._emit_progress(100)
                 self.finished.emit(self.token, False, True, [], "")
                 return
 
             if not files and results:
+                self._emit_progress(100)
                 self.finished.emit(self.token, False, False, [], "無法寫入最佳選課檔案。")
                 return
 
+            self._emit_progress(100)
             self.finished.emit(self.token, True, False, files, "")
         except Exception as e:
             if self._cancel_requested:
+                self._emit_progress(100)
                 self.finished.emit(self.token, False, True, [], "")
             else:
                 self.finished.emit(self.token, False, False, [], str(e))

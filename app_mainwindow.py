@@ -176,8 +176,6 @@ class MainWindow(QMainWindow):
         self._tt_drag_last_rect: Optional[Tuple[int, int, int, int]] = None
         self._tt_drag_has_moved = False
         self._tt_drag_initial_rect: Optional[Tuple[int, int, int, int]] = None
-        self._tt_drag_has_moved = False
-        self._tt_drag_initial_rect: Optional[Tuple[int, int, int, int]] = None
 
         self._session_fav_backup: Optional[Set[int]] = None
         self._session_inc_backup: Optional[Set[int]] = None
@@ -208,6 +206,13 @@ class MainWindow(QMainWindow):
         self._name_sorted: Optional[np.ndarray] = None
         self._teacher_sorted: Optional[np.ndarray] = None
         self._credit_sorted: Optional[np.ndarray] = None
+        self._all_depts: Set[str] = set()
+        self._cid_arr: Optional[np.ndarray] = None
+        self._mask_lo_arr: Optional[np.ndarray] = None
+        self._mask_hi_arr: Optional[np.ndarray] = None
+        self._tba_arr: Optional[np.ndarray] = None
+        self._dept_arr: Optional[np.ndarray] = None
+        self._slots_by_cid: Dict[int, Set[str]] = {}
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -612,7 +617,8 @@ class MainWindow(QMainWindow):
         self.best_progress = QProgressBar()
         self.best_progress.setRange(0, 100)
         self.best_progress.setValue(0)
-        self.best_progress.setTextVisible(False)
+        self.best_progress.setTextVisible(True)
+        self.best_progress.setFormat("完成度：%p%")
         self.best_progress.setVisible(False)
         hist_v.addWidget(self.best_progress)
         self.tbl_history = QTableWidget()
@@ -854,6 +860,12 @@ class MainWindow(QMainWindow):
             self._name_sorted = None
             self._teacher_sorted = None
             self._credit_sorted = None
+            self._cid_arr = None
+            self._mask_lo_arr = None
+            self._mask_hi_arr = None
+            self._tba_arr = None
+            self._dept_arr = None
+            self._slots_by_cid = {}
             return
 
         cids = self.courses_df["_cid"].to_numpy(dtype=np.int64, copy=True)
@@ -862,6 +874,23 @@ class MainWindow(QMainWindow):
         self._name_sorted = self.courses_df["中文課程名稱"].to_numpy(dtype=object, copy=False)[order]
         self._teacher_sorted = self.courses_df["教師"].to_numpy(dtype=object, copy=False)[order]
         self._credit_sorted = self.courses_df["學分"].to_numpy(dtype=float, copy=False)[order]
+
+        self._cid_arr = self.courses_df["_cid"].to_numpy(dtype=np.int64, copy=False)
+        self._mask_lo_arr = self.courses_df["_mask_lo"].to_numpy(dtype="uint64", copy=False)
+        self._mask_hi_arr = self.courses_df["_mask_hi"].to_numpy(dtype="uint64", copy=False)
+        self._tba_arr = self.courses_df["_tba"].to_numpy(dtype=bool, copy=False)
+        if "系所" in self.courses_df.columns:
+            self._dept_arr = self.courses_df["系所"].to_numpy(dtype=object, copy=False)
+        else:
+            self._dept_arr = None
+        self._slots_by_cid = {}
+        for cid, slots in zip(self.courses_df["_cid"].tolist(), self.courses_df["_slots_set"].tolist()):
+            try:
+                cid_i = int(cid)
+            except Exception:
+                continue
+            if isinstance(slots, set):
+                self._slots_by_cid[cid_i] = slots
 
     def _load_excel(self, path: str) -> None:
         ensure_excel_readable(path)
@@ -888,8 +917,11 @@ class MainWindow(QMainWindow):
         self.cb_dept.clear()
         self.cb_dept.addItem("(全部)")
         if "系所" in df.columns:
-            for d in sorted(df["系所"].dropna().astype(str).unique().tolist()):
+            self._all_depts = set(df["系所"].dropna().astype(str).unique().tolist())
+            for d in sorted(self._all_depts):
                 self.cb_dept.addItem(str(d))
+        else:
+            self._all_depts = set()
         self.cb_dept.blockSignals(False)
 
         if self.cb_dept.completer() is not None:
@@ -897,7 +929,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_user_selector()
 
-        self.filtered_df = df[self.display_columns].copy()
+        self.filtered_df = df.loc[:, self.display_columns]
         self.model_results.set_df(self.filtered_df)
         self.model_results.notify_favorites_changed()
         self.proxy_results.invalidate()
@@ -1550,6 +1582,7 @@ class MainWindow(QMainWindow):
         # Before clearing, save the vertical scroll position
         scrollbar = self.tbl_fav.verticalScrollBar()
         scroll_pos = scrollbar.value()
+        updates_enabled = self.tbl_fav.updatesEnabled()
 
         # Before clearing, save the current visual order of course IDs
         visual_order = []
@@ -1566,14 +1599,17 @@ class MainWindow(QMainWindow):
         was_drag_enabled = self.tbl_fav.is_drag_enabled()
         self.tbl_fav.set_drag_enabled(False)
 
+        self.tbl_fav.setUpdatesEnabled(False)
         self.tbl_fav.blockSignals(True)
         self.tbl_fav.setRowCount(0)
 
         join_rank = self._compress_join_order_map()
 
-        # If visual order was captured, use it. Otherwise, fall back to sorting by rank.
-        cids_to_render = visual_order
-        if not cids_to_render:
+        # If visual order was captured, use it only when it matches current favorites.
+        # Otherwise, fall back to sorting by rank from favorites_ids.
+        fav_set = set(int(x) for x in self.favorites_ids)
+        cids_to_render = [cid for cid in visual_order if cid in fav_set]
+        if len(cids_to_render) != len(fav_set):
             items = []
             for cid in self.favorites_ids:
                 cid_i = int(cid)
@@ -1648,15 +1684,101 @@ class MainWindow(QMainWindow):
                 self.tbl_fav.setCellWidget(r, self.FAV_COL_DELETE, btn)
 
         self.tbl_fav.blockSignals(False)
-        
+        self.tbl_fav.setUpdatesEnabled(updates_enabled)
+
         if was_drag_enabled:
             self.tbl_fav.set_drag_enabled(True)
         self._update_fav_drag_state()
-        
+
         self.tbl_fav.setSortingEnabled(sorting_enabled)
 
         # Restore the scroll position
         scrollbar.setValue(scroll_pos)
+
+    def _try_append_favorite_row(self, cid_i: int) -> bool:
+        if getattr(self, "tbl_fav", None) is None:
+            return False
+        # If the table is out of sync, fall back to full refresh.
+        if self.tbl_fav.rowCount() != (len(self.favorites_ids) - 1):
+            return False
+
+        sorting_enabled = self.tbl_fav.isSortingEnabled()
+        updates_enabled = self.tbl_fav.updatesEnabled()
+        self.tbl_fav.setUpdatesEnabled(False)
+        self.tbl_fav.blockSignals(True)
+
+        row = self.tbl_fav.rowCount()
+        self.tbl_fav.insertRow(row)
+
+        move_controls_enabled = self._is_fav_join_sort_active() and not self.readonly_mode
+        total_items = row + 1
+
+        handle_widget = self._build_move_widget(cid_i, row, total_items, enabled=move_controls_enabled)
+        self.tbl_fav.setCellWidget(row, self.FAV_COL_HANDLE, handle_widget)
+
+        is_lock = cid_i in self.locked_ids
+        in_course = True if is_lock else self._included_has(cid_i)
+
+        ck_item = IntSortItem("", 1 if in_course else 0)
+        if is_lock:
+            ck_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            ck_item.setCheckState(Qt.Checked)
+        else:
+            ck_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            ck_item.setCheckState(Qt.Checked if in_course else Qt.Unchecked)
+        ck_item.setData(FAV_CID_ROLE, cid_i)
+        self.tbl_fav.setItem(row, self.FAV_COL_SCHEDULE, ck_item)
+
+        lock_item = IntSortItem("", 1 if is_lock else 0)
+        lock_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        lock_item.setCheckState(Qt.Checked if is_lock else Qt.Unchecked)
+        lock_item.setData(FAV_CID_ROLE, cid_i)
+        self.tbl_fav.setItem(row, self.FAV_COL_LOCK, lock_item)
+
+        id_item = IntSortItem(format_cid4(cid_i), cid_i)
+        id_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        id_item.setData(Qt.UserRole, cid_i)
+        self.tbl_fav.setItem(row, self.FAV_COL_ID, id_item)
+
+        name_item = QTableWidgetItem(self._course_name_by_id(cid_i))
+        name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self.tbl_fav.setItem(row, self.FAV_COL_NAME, name_item)
+
+        t_item = QTableWidgetItem(self._teacher_by_id(cid_i))
+        t_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self.tbl_fav.setItem(row, self.FAV_COL_TEACHER, t_item)
+
+        cr = self._credit_by_id(cid_i)
+        cr_text = "" if cr == 0.0 else (str(int(cr)) if abs(cr - round(cr)) < 1e-9 else f"{cr:g}")
+        cr_item = FloatSortItem(cr_text, cr)
+        cr_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self.tbl_fav.setItem(row, self.FAV_COL_CREDIT, cr_item)
+
+        rank = len(self.favorites_ids)
+        rank_item = IntSortItem(str(rank), rank)
+        rank_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        rank_item.setData(FAV_CID_ROLE, cid_i)
+        self.tbl_fav.setItem(row, self.FAV_COL_RANK, rank_item)
+
+        if is_lock:
+            self.tbl_fav.setCellWidget(row, self.FAV_COL_DELETE, QWidget())
+        else:
+            btn = QPushButton("×")
+            btn.setProperty("cid", cid_i)
+            btn.setFixedWidth(32)
+            btn.setToolTip("刪除此最愛")
+            btn.clicked.connect(self.on_delete_favorite_button_clicked)
+            btn.setEnabled(not self.readonly_mode)
+            self.tbl_fav.setCellWidget(row, self.FAV_COL_DELETE, btn)
+
+        self.tbl_fav.blockSignals(False)
+        self.tbl_fav.setUpdatesEnabled(updates_enabled)
+
+        if sorting_enabled:
+            self.tbl_fav.sortItems(self._fav_sort_section, self._fav_sort_order)
+
+        self._update_fav_drag_state()
+        return True
 
     def _is_fav_join_sort_active(self) -> bool:
         return self._fav_sort_section == self.FAV_COL_RANK and self._fav_sort_order == Qt.AscendingOrder
@@ -2055,8 +2177,11 @@ class MainWindow(QMainWindow):
         self._mark_favorites_dirty()
         self._mark_included_dirty()
         self._mark_locked_dirty()
-
-        self._refresh_favorites_table()
+        if checked:
+            if not self._try_append_favorite_row(cid_i):
+                self._refresh_favorites_table()
+        else:
+            self._refresh_favorites_table()
         self._refresh_timetable()
         self.model_results.notify_favorites_changed()
         self.proxy_results.invalidate()
@@ -2277,7 +2402,7 @@ class MainWindow(QMainWindow):
         self._history_mode = "best"
         self._best_running = True
         self.gb_history.setTitle("最佳選課（選取後只讀檢視）")
-        self.best_progress.setRange(0, 0)
+        self.best_progress.setRange(0, 100)
         self.best_progress.setValue(0)
         self.best_progress.setVisible(True)
         self.tbl_history.setRowCount(0)
@@ -2384,6 +2509,7 @@ class MainWindow(QMainWindow):
             self.courses_df,
         )
         self._best_worker = worker
+        worker.progress.connect(self._on_best_schedule_progress)
         worker.finished.connect(self._on_best_schedule_finished)
         self.threadpool.start(worker)
 
@@ -2409,6 +2535,17 @@ class MainWindow(QMainWindow):
 
         self._best_files = list(files)
         self._enter_best_schedule_results()
+
+    def _on_best_schedule_progress(self, token: int, value: int) -> None:
+        if token != self._best_token:
+            return
+        if not self._best_running:
+            return
+        try:
+            v = int(value)
+        except Exception:
+            v = 0
+        self.best_progress.setValue(max(0, min(100, v)))
 
     def on_toggle_history(self) -> None:
         if self._best_running or self._history_mode == "best":
@@ -2536,7 +2673,25 @@ class MainWindow(QMainWindow):
             return 0.0
         if ids_sorted is None or ids_sorted.size == 0:
             return 0.0
-        sub = self.courses_df[self.courses_df["_cid"].isin([int(x) for x in ids_sorted.tolist()])][["學分"]]
+
+        if self._cid_sorted is not None and self._credit_sorted is not None:
+            ids = ids_sorted.astype(np.int64, copy=False)
+            pos = np.searchsorted(self._cid_sorted, ids)
+            if pos.size == 0:
+                return 0.0
+            valid = (pos >= 0) & (pos < self._cid_sorted.size)
+            if not np.any(valid):
+                return 0.0
+            pos = pos[valid]
+            ids = ids[valid]
+            match = self._cid_sorted[pos] == ids
+            if not np.any(match):
+                return 0.0
+            credits = self._credit_sorted[pos[match]]
+            total = float(np.nansum(credits)) if credits.size else 0.0
+            return total
+
+        sub = self.courses_df[self.courses_df["_cid"].isin(ids_sorted)][["學分"]]
         if sub.empty:
             return 0.0
         s = pd.to_numeric(sub["學分"], errors="coerce").fillna(0).sum()
@@ -2549,6 +2704,23 @@ class MainWindow(QMainWindow):
         slots: Set[Tuple[str, str]] = set()
         if self.courses_df is None or not ids:
             return slots
+        if self._slots_by_cid:
+            for cid in ids:
+                try:
+                    cid_i = int(cid)
+                except Exception:
+                    continue
+                slots_set = self._slots_by_cid.get(cid_i)
+                if not slots_set:
+                    continue
+                for slot in slots_set:
+                    if not isinstance(slot, str) or "-" not in slot:
+                        continue
+                    day, per = slot.split("-", 1)
+                    if day and per:
+                        slots.add((day, per))
+            return slots
+
         try:
             ids_list = [int(x) for x in ids]
         except Exception:
@@ -2855,16 +3027,16 @@ class MainWindow(QMainWindow):
             return
 
         df = self.courses_df
+        n = len(df)
+        mask = np.ones(n, dtype=bool)
 
         full = (self.ed_full.text() or "").strip()
         if full:
             tokens = [t.strip().lower() for t in full.split() if t.strip()]
             if tokens:
                 s = df["_alltext"]
-                mask = pd.Series(True, index=df.index)
                 for tok in tokens:
-                    mask &= s.str.contains(tok, regex=False, na=False)
-                df = df[mask]
+                    mask &= s.str.contains(tok, regex=False, na=False).to_numpy()
 
         special_gened = self.ck_gened.isChecked()
         special_sport = self.ck_sport.isChecked()
@@ -2880,67 +3052,89 @@ class MainWindow(QMainWindow):
                 except Exception:
                     continue
             if ids:
-                df = df[df["_cid"].isin(ids)]
+                cid_arr = self._cid_arr if self._cid_arr is not None else df["_cid"].to_numpy(dtype=np.int64, copy=False)
+                mask &= np.isin(cid_arr, np.array(ids, dtype=np.int64))
 
         code_q = (self.ed_course_code.text() or "").strip()
         if code_q and "開課代碼" in df.columns:
-            tokens = [t.strip() for t in code_q.split() if t.strip()]
+            tokens = [t.strip().lower() for t in code_q.split() if t.strip()]
             if tokens:
-                s = df["開課代碼"].astype(str)
-                mask = pd.Series(True, index=df.index)
+                s = df["_code_lc"] if "_code_lc" in df.columns else df["開課代碼"].astype(str).str.lower()
                 for tok in tokens:
-                    mask &= s.str.contains(tok, case=False, regex=False, na=False)
-                df = df[mask]
+                    mask &= s.str.contains(tok, regex=False, na=False).to_numpy()
 
         cname = self.ed_cname.text().strip()
         if cname and "中文課程名稱" in df.columns:
-            df = df[df["中文課程名稱"].astype(str).str.contains(cname, na=False)]
+            cname_lc = cname.lower()
+            if "_cname_lc" in df.columns:
+                mask &= df["_cname_lc"].str.contains(cname_lc, regex=False, na=False).to_numpy()
+            else:
+                mask &= df["中文課程名稱"].astype(str).str.contains(cname, na=False).to_numpy()
 
         teacher = self.ed_teacher.text().strip()
         if teacher and "教師" in df.columns:
-            df = df[df["教師"].astype(str).str.contains(teacher, na=False)]
+            teacher_lc = teacher.lower()
+            if "_teacher_lc" in df.columns:
+                mask &= df["_teacher_lc"].str.contains(teacher_lc, regex=False, na=False).to_numpy()
+            else:
+                mask &= df["教師"].astype(str).str.contains(teacher, na=False).to_numpy()
 
         apply_dept_filter = not (special_gened or special_sport)
         if apply_dept_filter:
             dept_text = self.cb_dept.currentText().strip()
             if dept_text and dept_text != "(全部)" and "系所" in df.columns:
-                all_depts = set(self.courses_df["系所"].dropna().astype(str).unique().tolist())
-                if dept_text in all_depts:
-                    df = df[df["系所"] == dept_text]
+                if dept_text in self._all_depts:
+                    if self._dept_arr is not None:
+                        mask &= (self._dept_arr == dept_text)
+                    else:
+                        mask &= (df["系所"] == dept_text).to_numpy()
                 else:
-                    df = df[df["系所"].astype(str).str.contains(dept_text, na=False)]
+                    dept_lc = dept_text.lower()
+                    if "_dept_lc" in df.columns:
+                        mask &= df["_dept_lc"].str.contains(dept_lc, regex=False, na=False).to_numpy()
+                    else:
+                        mask &= df["系所"].astype(str).str.contains(dept_text, na=False).to_numpy()
 
         elif special_gened and "系所" in df.columns:
-            df = df[df["系所"] == GENED_DEPT_NAME]
+            if self._dept_arr is not None:
+                mask &= (self._dept_arr == GENED_DEPT_NAME)
+            else:
+                mask &= (df["系所"] == GENED_DEPT_NAME).to_numpy()
             core_choice = self.cb_gened_core.currentText().strip()
             if core_choice and core_choice != "所有通識" and "_gened_cats" in df.columns:
-                mask = [core_choice in cats for cats in df["_gened_cats"]]
-                df = df[mask]
+                core_mask = np.array([core_choice in cats for cats in df["_gened_cats"]], dtype=bool)
+                mask &= core_mask
 
         elif special_sport and "系所" in df.columns:
-            df = df[df["系所"] == SPORT_DEPT_NAME]
+            if self._dept_arr is not None:
+                mask &= (self._dept_arr == SPORT_DEPT_NAME)
+            else:
+                mask &= (df["系所"] == SPORT_DEPT_NAME).to_numpy()
 
         elif special_teaching:
             if "中文課程名稱" in df.columns:
-                df = df[df["中文課程名稱"].astype(str).str.contains(TEACHING_NAME_TOKEN, na=False)]
+                mask &= df["中文課程名稱"].astype(str).str.contains(TEACHING_NAME_TOKEN, na=False).to_numpy()
 
         if self.ck_not_full.isChecked():
             if "限修人數" in df.columns and "選修人數" in df.columns:
-                df = df[(df["限修人數"].notna()) & (df["選修人數"].notna()) & (df["選修人數"] < df["限修人數"])]
+                nf = (df["限修人數"].notna()) & (df["選修人數"].notna()) & (df["選修人數"] < df["限修人數"])
+                mask &= nf.to_numpy()
 
         if self.ck_exclude_selected.isChecked():
             if self.included_ids:
-                df = df[~df["_cid"].isin(self.included_ids)]
+                cid_arr = self._cid_arr if self._cid_arr is not None else df["_cid"].to_numpy(dtype=np.int64, copy=False)
+                mask &= ~np.isin(cid_arr, np.array(list(self.included_ids), dtype=np.int64))
 
         if not self.ck_show_tba.isChecked():
-            df = df[~df["_tba"]]
+            tba = self._tba_arr if self._tba_arr is not None else df["_tba"].to_numpy(dtype=bool, copy=False)
+            mask &= ~tba
 
         if (self._sel_lo != 0) or (self._sel_hi != 0):
             sel_lo = np.uint64(self._sel_lo)
             sel_hi = np.uint64(self._sel_hi)
 
-            mlo = df["_mask_lo"].to_numpy(dtype="uint64", copy=False)
-            mhi = df["_mask_hi"].to_numpy(dtype="uint64", copy=False)
+            mlo = self._mask_lo_arr if self._mask_lo_arr is not None else df["_mask_lo"].to_numpy(dtype="uint64", copy=False)
+            mhi = self._mask_hi_arr if self._mask_hi_arr is not None else df["_mask_hi"].to_numpy(dtype="uint64", copy=False)
 
             mode = self.cb_match_mode.currentIndex()
             if mode == 0:
@@ -2948,7 +3142,7 @@ class MainWindow(QMainWindow):
             else:
                 cond = (np.bitwise_and(mlo, sel_lo) != 0) | (np.bitwise_and(mhi, sel_hi) != 0)
 
-            df = df.loc[df.index[cond]]
+            mask &= cond
 
         if self.ck_exclude_conflict.isChecked():
             inc_sorted = self._get_included_sorted()
@@ -2957,16 +3151,16 @@ class MainWindow(QMainWindow):
                 occ_lo = np.uint64(occ_lo)
                 occ_hi = np.uint64(occ_hi)
 
-                mlo = df["_mask_lo"].to_numpy(dtype="uint64", copy=False)
-                mhi = df["_mask_hi"].to_numpy(dtype="uint64", copy=False)
-                tba = df["_tba"].to_numpy(dtype=bool, copy=False)
+                mlo = self._mask_lo_arr if self._mask_lo_arr is not None else df["_mask_lo"].to_numpy(dtype="uint64", copy=False)
+                mhi = self._mask_hi_arr if self._mask_hi_arr is not None else df["_mask_hi"].to_numpy(dtype="uint64", copy=False)
+                tba = self._tba_arr if self._tba_arr is not None else df["_tba"].to_numpy(dtype=bool, copy=False)
 
                 cond_no_conflict = (np.bitwise_and(mlo, occ_lo) == 0) & (np.bitwise_and(mhi, occ_hi) == 0)
                 cond = cond_no_conflict | tba
-                df = df.loc[df.index[cond]]
+                mask &= cond
 
         cols = self.display_columns if self.display_columns else [c for c in df.columns if not str(c).startswith("_")]
-        self.filtered_df = df[cols].copy()
+        self.filtered_df = df.loc[mask, cols]
         self.model_results.set_df(self.filtered_df)
         self.model_results.notify_favorites_changed()
         self.proxy_results.invalidate()

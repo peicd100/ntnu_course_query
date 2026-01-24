@@ -17,11 +17,26 @@ def darken(color: QColor, factor: float) -> QColor:
     return QColor(r, g, b)
 
 
+def _subset_courses_by_ids(
+    courses_df: pd.DataFrame, included_ids_sorted: np.ndarray, cols: List[str]
+) -> pd.DataFrame:
+    if courses_df is None or courses_df.empty:
+        return pd.DataFrame(columns=cols)
+    if included_ids_sorted is None or included_ids_sorted.size == 0:
+        return courses_df.iloc[0:0][cols]
+
+    ids = included_ids_sorted.astype(np.int64, copy=False)
+    cid_arr = courses_df["_cid"].to_numpy(dtype=np.int64, copy=False)
+    mask = np.isin(cid_arr, ids)
+    if not mask.any():
+        return courses_df.iloc[0:0][cols]
+    return courses_df.loc[mask, cols]
+
+
 def occupied_masks_sorted(courses_df: pd.DataFrame, included_ids_sorted: np.ndarray) -> Tuple[np.uint64, np.uint64]:
     if included_ids_sorted is None or included_ids_sorted.size == 0:
         return np.uint64(0), np.uint64(0)
-
-    sub = courses_df[courses_df["_cid"].isin([int(x) for x in included_ids_sorted.tolist()])][["_mask_lo", "_mask_hi"]]
+    sub = _subset_courses_by_ids(courses_df, included_ids_sorted, ["_mask_lo", "_mask_hi"])
     if sub.empty:
         return np.uint64(0), np.uint64(0)
 
@@ -35,8 +50,7 @@ def occupied_masks_sorted(courses_df: pd.DataFrame, included_ids_sorted: np.ndar
 def build_lane_assignment_sorted(courses_df: pd.DataFrame, included_ids_sorted: np.ndarray) -> Tuple[Dict[int, int], int]:
     if included_ids_sorted is None or included_ids_sorted.size == 0:
         return {}, 1
-
-    sub = courses_df[courses_df["_cid"].isin([int(x) for x in included_ids_sorted.tolist()])][["_cid", "_slots_set"]]
+    sub = _subset_courses_by_ids(courses_df, included_ids_sorted, ["_cid", "_slots_set"])
     if sub.empty:
         return {}, 1
 
@@ -90,9 +104,11 @@ def build_timetable_matrix_per_day_lanes_sorted(
     lane_map, _ = build_lane_assignment_sorted(courses_df, included_ids_sorted)
     day_lanes: Dict[str, int] = {d: 1 for d in show_days}
 
-    subset_meta = courses_df[courses_df["_cid"].isin([int(x) for x in included_ids_sorted.tolist()])][
-        ["_cid", "中文課程名稱", "_slots_set"]
-    ]
+    subset_meta = _subset_courses_by_ids(
+        courses_df,
+        included_ids_sorted,
+        ["_cid", "中文課程名稱", "_slots_set"],
+    )
 
     for cid, _cname, slots in subset_meta.itertuples(index=False, name=None):
         cid_i = int(cid)

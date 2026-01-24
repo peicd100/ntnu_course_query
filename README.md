@@ -138,7 +138,7 @@ python app_main.py
 建議使用 `--onedir`（較容易處理 Qt 依賴）：
 
 ```
-pyinstaller --noconsole --onedir --name "師大課程查詢系統" app_main.py
+pyinstaller --noconsole --onedir --name "師大課程查詢系統" app_main.py -y
 ```
 
 輸出位置（預設）：
