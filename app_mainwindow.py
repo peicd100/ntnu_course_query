@@ -6,7 +6,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
-from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -14,14 +13,17 @@ import pandas as pd
 from PySide6.QtCore import (
     Qt,
     QEvent,
+    QPoint,
     QSignalBlocker,
     QTimer,
     QSortFilterProxyModel,
     QThreadPool,
 )
-from PySide6.QtGui import QAction, QBrush, QColor, QFontMetrics
+from PySide6.QtGui import QAction, QBrush, QColor, QFontMetrics, QPainter, QPageLayout, QPageSize
+from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractButton,
     QAbstractItemView,
     QCheckBox,
     QComboBox,
@@ -57,7 +59,7 @@ from app_constants import (
     course_input_dir_path,
 )
 from app_excel import ensure_excel_readable, load_courses_auto
-from app_timetable_logic import build_timetable_matrix_per_day_lanes_sorted, darken, occupied_masks_sorted
+from app_timetable_logic import build_timetable_matrix_per_day_lanes_sorted, darken, occupied_masks_sorted, occupied_masks_from_arrays
 from app_user_data import (
     best_schedule_dir_path,
     list_all_users,
@@ -153,6 +155,11 @@ class MainWindow(QMainWindow):
         self._locked_sorted_cache = np.empty((0,), dtype=np.int64)
         self._locked_sorted_dirty = True
 
+        # B-01: Cache for occupied masks
+        self._occ_lo = np.uint64(0)
+        self._occ_hi = np.uint64(0)
+        self._occ_cache_key: Optional[int] = None
+
         self._sel_lo = np.uint64(0)
         self._sel_hi = np.uint64(0)
 
@@ -200,7 +207,15 @@ class MainWindow(QMainWindow):
             QColor("#FFFDF2"),
             QColor("#F2FFFF"),
         ]
+        # E-02: Brush/Color Cache
+        self._brush_black = QBrush(QColor("#000000"))
+        self._brush_white = QBrush(QColor("#FFFFFF"))
+        self._brush_added = QBrush(QColor("#1B5E20"))
+        self._brush_added_fg = QBrush(QColor("#FFFFFF"))
+        self._brush_deleted = QBrush(QColor("#B71C1C"))
         self._block_dark_factor = 0.82
+        self._brush_cache_base: List[QBrush] = []
+        self._brush_cache_darker: List[QBrush] = []
 
         self._cid_sorted: Optional[np.ndarray] = None
         self._name_sorted: Optional[np.ndarray] = None
@@ -212,9 +227,14 @@ class MainWindow(QMainWindow):
         self._mask_hi_arr: Optional[np.ndarray] = None
         self._tba_arr: Optional[np.ndarray] = None
         self._dept_arr: Optional[np.ndarray] = None
+        self._is_teaching_arr: Optional[np.ndarray] = None
+        self._is_sport_arr: Optional[np.ndarray] = None
+        self._not_full_arr: Optional[np.ndarray] = None
+        self._gened_mask_arr: Optional[np.ndarray] = None
         self._slots_by_cid: Dict[int, Set[str]] = {}
 
         self._search_timer = QTimer(self)
+        self._last_search_signature: Optional[Tuple] = None # B-07: Search signature cache
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self._do_search_now)
 
@@ -245,8 +265,10 @@ class MainWindow(QMainWindow):
         self._fav_sort_order = Qt.AscendingOrder
 
         self._build_menu()
+        self._init_timetable_brushes()
         self._build_ui()
-        self._try_autoload_default_excel()
+        # 延遲載入 Excel，讓視窗先顯示，提升體感啟動速度
+        QTimer.singleShot(10, self._try_autoload_default_excel)
 
     # ====== UI / Menu ======
     def showEvent(self, event):
@@ -254,6 +276,13 @@ class MainWindow(QMainWindow):
         if not self._default_sizes_applied:
             self._default_sizes_applied = True
             QTimer.singleShot(0, self._apply_default_panel_sizes)
+
+    def _init_timetable_brushes(self) -> None:
+        self._brush_cache_base = []
+        self._brush_cache_darker = []
+        for c in self._day_bg_base:
+            self._brush_cache_base.append(QBrush(c))
+            self._brush_cache_darker.append(QBrush(darken(c, self._block_dark_factor)))
 
     def _build_menu(self) -> None:
         open_act = QAction("開啟課程 Excel…", self)
@@ -266,6 +295,11 @@ class MainWindow(QMainWindow):
         file_menu = menubar.addMenu("檔案")
         file_menu.addAction(open_act)
         file_menu.addAction(reload_act)
+
+        help_menu = menubar.addMenu("說明")
+        about_act = QAction("關於", self)
+        about_act.triggered.connect(self.on_about)
+        help_menu.addAction(about_act)
 
     def _configure_combo_searchable(self, cb: QComboBox, placeholder: str) -> None:
         cb.setEditable(True)
@@ -359,6 +393,10 @@ class MainWindow(QMainWindow):
 
         header_row = QHBoxLayout()
         header_row.addStretch(1)
+
+        self.btn_export_pdf = QPushButton("匯出 PDF")
+        self.btn_export_pdf.clicked.connect(self.on_export_pdf)
+        header_row.addWidget(self.btn_export_pdf, 0, Qt.AlignRight)
 
         self.btn_show_time = QPushButton("顯示時間")
         self.btn_show_time.setCheckable(True)
@@ -865,7 +903,12 @@ class MainWindow(QMainWindow):
             self._mask_hi_arr = None
             self._tba_arr = None
             self._dept_arr = None
+            self._is_teaching_arr = None
+            self._is_sport_arr = None
+            self._not_full_arr = None
+            self._gened_mask_arr = None
             self._slots_by_cid = {}
+            self._last_search_signature = None
             return
 
         cids = self.courses_df["_cid"].to_numpy(dtype=np.int64, copy=True)
@@ -879,6 +922,14 @@ class MainWindow(QMainWindow):
         self._mask_lo_arr = self.courses_df["_mask_lo"].to_numpy(dtype="uint64", copy=False)
         self._mask_hi_arr = self.courses_df["_mask_hi"].to_numpy(dtype="uint64", copy=False)
         self._tba_arr = self.courses_df["_tba"].to_numpy(dtype=bool, copy=False)
+        if "_is_teaching" in self.courses_df.columns:
+            self._is_teaching_arr = self.courses_df["_is_teaching"].to_numpy(dtype=bool, copy=False)
+        if "_is_sport" in self.courses_df.columns:
+            self._is_sport_arr = self.courses_df["_is_sport"].to_numpy(dtype=bool, copy=False)
+        if "_not_full" in self.courses_df.columns:
+            self._not_full_arr = self.courses_df["_not_full"].to_numpy(dtype=bool, copy=False)
+        if "_gened_mask" in self.courses_df.columns:
+            self._gened_mask_arr = self.courses_df["_gened_mask"].to_numpy(dtype=np.uint32, copy=False)
         if "系所" in self.courses_df.columns:
             self._dept_arr = self.courses_df["系所"].to_numpy(dtype=object, copy=False)
         else:
@@ -930,7 +981,7 @@ class MainWindow(QMainWindow):
         self._refresh_user_selector()
 
         self.filtered_df = df.loc[:, self.display_columns]
-        self.model_results.set_df(self.filtered_df)
+        self.model_results.set_data_view(df, None, self.display_columns)
         self.model_results.notify_favorites_changed()
         self.proxy_results.invalidate()
 
@@ -2607,6 +2658,103 @@ class MainWindow(QMainWindow):
         self.schedule_search(0)
         self._update_history_highlights()
 
+    def on_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "關於 師大課程查詢系統",
+            "<h3>師大課程查詢與排課系統 (優化版)</h3>"
+            "<p>版本：v1.1.0</p>"
+            "<p>這是一個基於 Python 與 PySide6 開發的桌面應用程式，專為師大課程查詢與排課設計。</p>"
+            "<p>本版本經過效能優化，針對大量課程資料的搜尋、篩選與最佳選課運算進行了大幅度的加速。</p>"
+        )
+
+    def on_export_pdf(self) -> None:
+        # Default filename
+        uname = self.username if self.username else "未命名"
+        base_name = f"課表_{uname}"
+
+        # Determine default directory
+        # Priority: D:\Downloads -> C:\Downloads -> User Profile Downloads
+        default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        if os.path.exists(r"D:\Downloads"):
+            default_dir = r"D:\Downloads"
+        elif os.path.exists(r"C:\Downloads"):
+            default_dir = r"C:\Downloads"
+
+        initial_path = os.path.join(default_dir, f"{base_name}.pdf")
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "匯出 PDF", initial_path, "PDF Files (*.pdf)"
+        )
+        if not filename:
+            return
+
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(filename)
+        printer.setPageSize(QPageSize(QPageSize.A4))
+        printer.setPageOrientation(QPageLayout.Portrait)
+        
+        # Setup painter
+        painter = QPainter()
+        if not painter.begin(printer):
+            QMessageBox.critical(self, "匯出失敗", "無法初始化印表機。")
+            return
+            
+        # Hide the top-left corner button (select all button)
+        corner_btn = self.tbl_tt.findChild(QAbstractButton)
+        if corner_btn:
+            corner_btn.setVisible(False)
+
+        # Disable boxes in delegate
+        delegate = self.tbl_tt.itemDelegate()
+        if hasattr(delegate, "show_boxes"):
+            delegate.show_boxes = False
+
+        # Save current size and state
+        old_size = self.tbl_tt.size()
+        old_min = self.tbl_tt.minimumSize()
+        old_max = self.tbl_tt.maximumSize()
+        
+        # Calculate full size required to show all content
+        # Width: Vertical Header + All Columns + Frames
+        full_w = self.tbl_tt.verticalHeader().width() + self.tbl_tt.horizontalHeader().length() + self.tbl_tt.frameWidth() * 2
+        # Height: Horizontal Header + All Rows + Frames
+        full_h = self.tbl_tt.horizontalHeader().height() + self.tbl_tt.verticalHeader().length() + self.tbl_tt.frameWidth() * 2
+        
+        # Resize widget to full content size to ensure render() captures everything
+        self.tbl_tt.setFixedSize(full_w, full_h)
+
+        # Calculate scale to fit width
+        page_rect = printer.pageLayout().paintRectPixels(printer.resolution())
+        table_width = self.tbl_tt.width()
+        table_height = self.tbl_tt.height()
+        
+        scale_x = page_rect.width() / table_width if table_width > 0 else 1.0
+        scale_y = page_rect.height() / table_height if table_height > 0 else 1.0
+        scale = min(scale_x, scale_y)
+        
+        painter.scale(scale, scale)
+
+        # Center horizontally
+        x_off = (page_rect.width() / scale - table_width) / 2
+        self.tbl_tt.render(painter, QPoint(int(x_off), 0))
+
+        painter.end()
+        
+        # Restore original state
+        self.tbl_tt.setMinimumSize(old_min)
+        self.tbl_tt.setMaximumSize(old_max)
+        self.tbl_tt.resize(old_size)
+
+        if hasattr(delegate, "show_boxes"):
+            delegate.show_boxes = True
+
+        if corner_btn:
+            corner_btn.setVisible(True)
+
+        QMessageBox.information(self, "匯出成功", f"已匯出至：\n{filename}")
+
     def on_back_to_session(self) -> None:
         self.tbl_history.blockSignals(True)
         self.tbl_history.clearSelection()
@@ -2757,23 +2905,24 @@ class MainWindow(QMainWindow):
         if len(col_day_idx) != cols:
             return
 
+        # E-02: Use precomputed base brushes
         for c in range(cols):
             day_idx = col_day_idx[c]
-            base = self._day_bg_base[day_idx % len(self._day_bg_base)]
+            brush = self._brush_cache_base[day_idx % len(self._brush_cache_base)]
             header_item = widget.horizontalHeaderItem(c)
             if header_item is not None:
-                header_item.setBackground(QBrush(base))
+                header_item.setBackground(brush)
 
-        black_bg = QBrush(QColor("#000000"))
-        white_fg = QBrush(QColor("#FFFFFF"))
-        added_brush = QBrush(QColor("#1B5E20"))
-        added_fg = QBrush(QColor("#FFFFFF"))
-        deleted_brush = QBrush(QColor("#B71C1C"))
+        black_bg = self._brush_black
+        white_fg = self._brush_white
+        added_brush = self._brush_added
+        added_fg = self._brush_added_fg
+        deleted_brush = self._brush_deleted
 
         for c in range(cols):
             day_idx = col_day_idx[c]
-            base = self._day_bg_base[day_idx % len(self._day_bg_base)]
-            darker = darken(base, self._block_dark_factor)
+            base_brush = self._brush_cache_base[day_idx % len(self._brush_cache_base)]
+            darker_brush = self._brush_cache_darker[day_idx % len(self._brush_cache_darker)]
 
             course_to_shade: Dict[int, int] = {}
             next_shade = 0
@@ -2802,10 +2951,10 @@ class MainWindow(QMainWindow):
                     prev_cid = cid
                     continue
 
-                it.setForeground(QBrush(QColor("#000000")))
+                it.setForeground(black_bg)
 
                 if cid is None:
-                    it.setBackground(QBrush(base))
+                    it.setBackground(base_brush)
                     prev_cid = None
                     continue
 
@@ -2814,7 +2963,7 @@ class MainWindow(QMainWindow):
                         course_to_shade[cid] = next_shade % 2
                         next_shade += 1
                 shade = course_to_shade.get(cid, 0)
-                it.setBackground(QBrush(base if shade == 0 else darker))
+                it.setBackground(base_brush if shade == 0 else darker_brush)
                 prev_cid = cid
 
         if diff_removed_cells:
@@ -2834,6 +2983,8 @@ class MainWindow(QMainWindow):
         baseline_slots: Optional[Set[Tuple[str, str]]] = None,
         diff_added_cids: Optional[Set[int]] = None,
     ) -> List[str]:
+        # E-01: Disable updates before massive changes
+        widget.setUpdatesEnabled(False)
         matrix, conflicts, day_lanes, col_day_idx, id_matrix, locked_matrix = build_timetable_matrix_per_day_lanes_sorted(
             self.courses_df,
             included_sorted,
@@ -2866,25 +3017,31 @@ class MainWindow(QMainWindow):
             vlabels = PERIODS
         widget.setVerticalHeaderLabels(vlabels)
 
-        slot_map: Set[Tuple[str, str]] = set()
-        day_map = {idx: self.show_days[idx] for idx in range(len(self.show_days))}
-        for c in range(cols):
-            day_idx = col_day_idx[c] if c < len(col_day_idx) else None
-            day_name = day_map.get(day_idx)
-            if day_name is None:
-                continue
-            for r in range(len(PERIODS)):
-                cid = id_matrix[r][c] if (r < len(id_matrix) and c < len(id_matrix[r])) else None
-                if cid is not None and 0 <= r < len(PERIODS):
-                    slot_map.add((day_name, PERIODS[r]))
+        # E-04: Optimize slot_map collection
+        # Instead of scanning the matrix, use _collect_slots_for_ids on the included set
+        # We only need slots that are within show_days
+        full_slots = self._collect_slots_for_ids(set(included_sorted))
+        show_days_set = set(self.show_days)
+        slot_map: Set[Tuple[str, str]] = {
+            (d, p) for (d, p) in full_slots if d in show_days_set
+        }
 
         for r in range(len(PERIODS)):
             for c in range(cols):
-                it = QTableWidgetItem(matrix[r][c])
-                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                it.setTextAlignment(Qt.AlignLeft | Qt.AlignTop)
-                widget.setItem(r, c, it)
+                # E-01: Reuse existing items
+                it = widget.item(r, c)
+                if it is None:
+                    it = QTableWidgetItem(matrix[r][c])
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                    it.setTextAlignment(Qt.AlignLeft | Qt.AlignTop)
+                    widget.setItem(r, c, it)
+                elif it.text() != matrix[r][c]:
+                    # Optimization: Only update text if changed to avoid unnecessary repaints
+                    it.setText(matrix[r][c])
+                else:
+                    pass
 
+        from app_constants import PERIOD_INDEX
         deleted_cells: Optional[Set[Tuple[int, int]]] = None
         if baseline_slots:
             removed_slots = baseline_slots - slot_map
@@ -2896,9 +3053,9 @@ class MainWindow(QMainWindow):
                     if day_idx is None:
                         continue
                     try:
-                        row_idx = PERIODS.index(per)
-                    except ValueError:
-                        continue
+                        row_idx = PERIOD_INDEX[per] # E-03: Use PERIOD_INDEX
+                    except KeyError:
+                        continue # Should not happen if data is valid
                     for c in range(cols):
                         if c >= len(col_day_idx) or col_day_idx[c] != day_idx:
                             continue
@@ -2925,6 +3082,7 @@ class MainWindow(QMainWindow):
         else:
             widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
 
+        widget.setUpdatesEnabled(True)
         return conflicts
 
     def _refresh_history_preview_timetable(self) -> None:
@@ -3026,23 +3184,37 @@ class MainWindow(QMainWindow):
         if self.courses_df is None:
             return
 
-        df = self.courses_df
-        n = len(df)
-        mask = np.ones(n, dtype=bool)
-
+        # B-07: Search signature cache
+        # Collect all search parameters first
         full = (self.ed_full.text() or "").strip()
-        if full:
-            tokens = [t.strip().lower() for t in full.split() if t.strip()]
-            if tokens:
-                s = df["_alltext"]
-                for tok in tokens:
-                    mask &= s.str.contains(tok, regex=False, na=False).to_numpy()
+        serial = self.ed_serial.text().strip()
+        code_q = (self.ed_course_code.text() or "").strip()
+        cname = self.ed_cname.text().strip()
+        teacher = self.ed_teacher.text().strip()
+        dept_text = self.cb_dept.currentText().strip()
 
         special_gened = self.ck_gened.isChecked()
         special_sport = self.ck_sport.isChecked()
         special_teaching = self.ck_teaching.isChecked()
+        
+        current_sig = (
+            full, serial, code_q, cname, teacher, dept_text,
+            special_gened, special_sport, special_teaching,
+            self.ck_not_full.isChecked(), self.ck_exclude_selected.isChecked(),
+            self.ck_show_tba.isChecked(), self.ck_exclude_conflict.isChecked(),
+            self.cb_match_mode.currentIndex(), self.cb_gened_core.currentText(),
+            self._sel_lo, self._sel_hi,
+            hash(tuple(self._get_included_sorted())) if self.ck_exclude_conflict.isChecked() or self.ck_exclude_selected.isChecked() else 0
+        )
+        
+        if self._last_search_signature == current_sig:
+            return
+        self._last_search_signature = current_sig
 
-        serial = self.ed_serial.text().strip()
+        df = self.courses_df
+        n = len(df)
+        mask = np.ones(n, dtype=bool)
+
         if serial:
             ids: List[int] = []
             raw = serial.replace(",", " ").replace("，", " ")
@@ -3052,36 +3224,32 @@ class MainWindow(QMainWindow):
                 except Exception:
                     continue
             if ids:
-                cid_arr = self._cid_arr if self._cid_arr is not None else df["_cid"].to_numpy(dtype=np.int64, copy=False)
-                mask &= np.isin(cid_arr, np.array(ids, dtype=np.int64))
-
-        code_q = (self.ed_course_code.text() or "").strip()
-        if code_q and "開課代碼" in df.columns:
-            tokens = [t.strip().lower() for t in code_q.split() if t.strip()]
-            if tokens:
-                s = df["_code_lc"] if "_code_lc" in df.columns else df["開課代碼"].astype(str).str.lower()
-                for tok in tokens:
-                    mask &= s.str.contains(tok, regex=False, na=False).to_numpy()
-
-        cname = self.ed_cname.text().strip()
-        if cname and "中文課程名稱" in df.columns:
-            cname_lc = cname.lower()
-            if "_cname_lc" in df.columns:
-                mask &= df["_cname_lc"].str.contains(cname_lc, regex=False, na=False).to_numpy()
-            else:
-                mask &= df["中文課程名稱"].astype(str).str.contains(cname, na=False).to_numpy()
-
-        teacher = self.ed_teacher.text().strip()
-        if teacher and "教師" in df.columns:
-            teacher_lc = teacher.lower()
-            if "_teacher_lc" in df.columns:
-                mask &= df["_teacher_lc"].str.contains(teacher_lc, regex=False, na=False).to_numpy()
-            else:
-                mask &= df["教師"].astype(str).str.contains(teacher, na=False).to_numpy()
+                if self._cid_arr is not None:
+                    # Optimization: Use searchsorted (O(k log N)) instead of isin (O(N))
+                    # Since k (number of serials typed) is small, this is much faster.
+                    ids_arr = np.array(ids, dtype=np.int64)
+                    indices = np.searchsorted(self._cid_arr, ids_arr)
+                    
+                    # Filter valid indices
+                    valid = (indices < len(self._cid_arr))
+                    if not valid.all():
+                        indices = indices[valid]
+                        ids_arr = ids_arr[valid]
+                    
+                    # Check exact matches
+                    matched = (self._cid_arr[indices] == ids_arr)
+                    final_indices = indices[matched]
+                    
+                    serial_mask = np.zeros(n, dtype=bool)
+                    serial_mask[final_indices] = True
+                    mask &= serial_mask
+                else:
+                    # Fallback if index not built (should not happen normally)
+                    cid_arr = df["_cid"].to_numpy(dtype=np.int64, copy=False)
+                    mask &= np.isin(cid_arr, np.array(ids, dtype=np.int64))
 
         apply_dept_filter = not (special_gened or special_sport)
         if apply_dept_filter:
-            dept_text = self.cb_dept.currentText().strip()
             if dept_text and dept_text != "(全部)" and "系所" in df.columns:
                 if dept_text in self._all_depts:
                     if self._dept_arr is not None:
@@ -3101,29 +3269,44 @@ class MainWindow(QMainWindow):
             else:
                 mask &= (df["系所"] == GENED_DEPT_NAME).to_numpy()
             core_choice = self.cb_gened_core.currentText().strip()
-            if core_choice and core_choice != "所有通識" and "_gened_cats" in df.columns:
-                core_mask = np.array([core_choice in cats for cats in df["_gened_cats"]], dtype=bool)
-                mask &= core_mask
+            if core_choice and core_choice != "所有通識":
+                # B-04: Use bitmask
+                if self._gened_mask_arr is not None:
+                    from app_constants import GENED_CORE_OPTIONS
+                    if core_choice in GENED_CORE_OPTIONS:
+                        bit = 1 << GENED_CORE_OPTIONS.index(core_choice)
+                        mask &= (self._gened_mask_arr & bit) != 0
 
         elif special_sport and "系所" in df.columns:
-            if self._dept_arr is not None:
+            # B-05: Use precomputed boolean
+            if self._is_sport_arr is not None:
+                mask &= self._is_sport_arr
+            elif self._dept_arr is not None:
                 mask &= (self._dept_arr == SPORT_DEPT_NAME)
             else:
                 mask &= (df["系所"] == SPORT_DEPT_NAME).to_numpy()
 
         elif special_teaching:
-            if "中文課程名稱" in df.columns:
+            # B-05: Use precomputed boolean
+            if self._is_teaching_arr is not None:
+                mask &= self._is_teaching_arr
+            elif "中文課程名稱" in df.columns:
                 mask &= df["中文課程名稱"].astype(str).str.contains(TEACHING_NAME_TOKEN, na=False).to_numpy()
 
         if self.ck_not_full.isChecked():
-            if "限修人數" in df.columns and "選修人數" in df.columns:
-                nf = (df["限修人數"].notna()) & (df["選修人數"].notna()) & (df["選修人數"] < df["限修人數"])
-                mask &= nf.to_numpy()
+            # B-05: Use precomputed boolean
+            if self._not_full_arr is not None:
+                mask &= self._not_full_arr
+            elif "限修人數" in df.columns and "選修人數" in df.columns:
+                mask &= ((df["限修人數"].notna()) & (df["選修人數"].notna()) & (df["選修人數"] < df["限修人數"])).to_numpy()
 
         if self.ck_exclude_selected.isChecked():
             if self.included_ids:
                 cid_arr = self._cid_arr if self._cid_arr is not None else df["_cid"].to_numpy(dtype=np.int64, copy=False)
-                mask &= ~np.isin(cid_arr, np.array(list(self.included_ids), dtype=np.int64))
+                # B-02: Use _get_included_sorted()
+                inc_sorted = self._get_included_sorted()
+                if inc_sorted.size > 0:
+                    mask &= ~np.isin(cid_arr, inc_sorted)
 
         if not self.ck_show_tba.isChecked():
             tba = self._tba_arr if self._tba_arr is not None else df["_tba"].to_numpy(dtype=bool, copy=False)
@@ -3147,9 +3330,19 @@ class MainWindow(QMainWindow):
         if self.ck_exclude_conflict.isChecked():
             inc_sorted = self._get_included_sorted()
             if inc_sorted.size:
-                occ_lo, occ_hi = occupied_masks_sorted(self.courses_df, inc_sorted)
-                occ_lo = np.uint64(occ_lo)
-                occ_hi = np.uint64(occ_hi)
+                # B-01: Cache occupied masks
+                current_key = hash(tuple(inc_sorted))
+                if self._occ_cache_key == current_key:
+                    occ_lo, occ_hi = self._occ_lo, self._occ_hi
+                else:
+                    # F-01: Use optimized calculation
+                    if self._cid_arr is not None and self._mask_lo_arr is not None:
+                        occ_lo, occ_hi = occupied_masks_from_arrays(self._mask_lo_arr, self._mask_hi_arr, self._cid_arr, inc_sorted)
+                    else:
+                        occ_lo, occ_hi = occupied_masks_sorted(self.courses_df, inc_sorted)
+                    self._occ_lo = occ_lo
+                    self._occ_hi = occ_hi
+                    self._occ_cache_key = current_key
 
                 mlo = self._mask_lo_arr if self._mask_lo_arr is not None else df["_mask_lo"].to_numpy(dtype="uint64", copy=False)
                 mhi = self._mask_hi_arr if self._mask_hi_arr is not None else df["_mask_hi"].to_numpy(dtype="uint64", copy=False)
@@ -3159,8 +3352,72 @@ class MainWindow(QMainWindow):
                 cond = cond_no_conflict | tba
                 mask &= cond
 
+        # Optimization: Apply heavy text filters only on the remaining subset if small
+        # This avoids scanning the entire dataframe for strings when other filters have already narrowed it down.
+        
+        text_filters_active = bool(full or code_q or cname or teacher)
+        
+        if text_filters_active:
+            # Check how many rows are left
+            current_count = np.count_nonzero(mask)
+            
+            # If mask is empty, no need to search
+            if current_count > 0:
+                # Threshold for subsetting (heuristic)
+                # If remaining rows are few, subsetting is faster than full scan
+                SUBSET_THRESHOLD = 4000 
+                
+                target_df = df
+                target_mask = mask
+                is_subset = False
+                indices = None
+
+                if current_count < SUBSET_THRESHOLD:
+                    is_subset = True
+                    indices = np.flatnonzero(mask)
+                    target_df = df.iloc[indices]
+                    # Create a temporary mask for the subset (all True initially)
+                    target_mask = np.ones(len(target_df), dtype=bool)
+
+                # Helper to apply mask
+                def apply_text_mask(m):
+                    nonlocal target_mask
+                    target_mask &= m
+
+                if full:
+                    tokens = [t.strip().lower() for t in full.split() if t.strip()]
+                    if tokens:
+                        s = target_df["_alltext"]
+                        for tok in tokens:
+                            apply_text_mask(s.str.contains(tok, regex=False, na=False).to_numpy())
+
+                if code_q and "開課代碼" in target_df.columns:
+                    tokens = [t.strip().lower() for t in code_q.split() if t.strip()]
+                    if tokens:
+                        s = target_df["_code_lc"] if "_code_lc" in target_df.columns else target_df["開課代碼"].astype(str).str.lower()
+                        for tok in tokens:
+                            apply_text_mask(s.str.contains(tok, regex=False, na=False).to_numpy())
+
+                if cname and "中文課程名稱" in target_df.columns:
+                    cname_lc = cname.lower()
+                    s = target_df["_cname_lc"] if "_cname_lc" in target_df.columns else target_df["中文課程名稱"].astype(str).str.lower()
+                    apply_text_mask(s.str.contains(cname_lc, regex=False, na=False).to_numpy())
+
+                if teacher and "教師" in target_df.columns:
+                    teacher_lc = teacher.lower()
+                    s = target_df["_teacher_lc"] if "_teacher_lc" in target_df.columns else target_df["教師"].astype(str).str.lower()
+                    apply_text_mask(s.str.contains(teacher_lc, regex=False, na=False).to_numpy())
+
+                if is_subset:
+                    # Map subset mask back to original mask
+                    mask[indices] = target_mask
+                else:
+                    mask = target_mask
+
         cols = self.display_columns if self.display_columns else [c for c in df.columns if not str(c).startswith("_")]
-        self.filtered_df = df.loc[mask, cols]
-        self.model_results.set_df(self.filtered_df)
+        
+        # B-03: Use row-index mapping instead of creating new DataFrame
+        visible_indices = np.flatnonzero(mask).astype(np.int32)
+        self.model_results.set_data_view(df, visible_indices, cols)
         self.model_results.notify_favorites_changed()
         self.proxy_results.invalidate()

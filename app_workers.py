@@ -190,13 +190,30 @@ class BestScheduleWorker(QObject, QRunnable):
         order_map = self._build_order_map()
         base_mask = (int(base_hi) << 64) | int(base_lo)
 
-        items = []
+        # G-05: Deduplicate candidates by mask
+        # If multiple courses have the exact same time mask, we only need to keep the "best" one
+        # (highest credit, then lowest priority/order_val).
+        # This reduces N for the exponential complexity of enumerate_half.
+        best_by_mask: Dict[int, Tuple[float, int, Tuple[int, float, int, int, int]]] = {}
+
         for item in cand:
             mask = (int(item.mask_hi) << 64) | int(item.mask_lo)
             if mask & base_mask:
                 continue
-            order_val = int(order_map.get(int(item.cid), 10**12))
-            items.append((int(item.cid), float(item.credit), int(item.gened), int(mask), order_val))
+            
+            cid = int(item.cid)
+            credit = float(item.credit)
+            gened = int(item.gened)
+            order_val = int(order_map.get(cid, 10**12))
+            
+            if mask in best_by_mask:
+                curr_credit, curr_prio, _ = best_by_mask[mask]
+                if credit > curr_credit or (credit == curr_credit and order_val < curr_prio):
+                    best_by_mask[mask] = (credit, order_val, (cid, credit, gened, mask, order_val))
+            else:
+                best_by_mask[mask] = (credit, order_val, (cid, credit, gened, mask, order_val))
+
+        items = [val[2] for val in best_by_mask.values()]
 
         mid = len(items) // 2
         left_items = items[:mid]
@@ -213,38 +230,114 @@ class BestScheduleWorker(QObject, QRunnable):
             ka = order_key_for_ids(a.ids)
             kb = order_key_for_ids(b.ids)
             return ka < kb
+            
+        def reconstruct_ids(idx: int, parents: List[int], last_cids: List[int]) -> tuple:
+            path = []
+            curr = idx
+            while curr > 0: # 0 is root (empty)
+                path.append(last_cids[curr])
+                curr = parents[curr]
+            return tuple(reversed(path))
 
         def enumerate_half(
             items_half: List[Tuple[int, float, int, int, int]],
             progress_start: int,
             progress_span: int,
         ) -> Dict[int, _HalfEntry]:
-            results: Dict[int, _HalfEntry] = {
-                0: _HalfEntry(mask=0, credit=0.0, gened=0, ids=tuple(), priority_sum=0)
-            }
+            # G-01: Use parallel lists and avoid snapshot copy
+            # G-02: Use tuple instead of _HalfEntry object to reduce overhead
+            # G-03: Use parent pointers to avoid creating tuples in the loop
+            # State: mask -> (credit, gened, ids, priority_sum)
+            
+            # Initialize with empty state
+            # results_map maps mask -> index in parallel lists
+            results_map: Dict[int, int] = {0: 0}
+            
+            # Parallel lists
+            r_masks = [0]
+            r_credits = [0.0]
+            r_geneds = [0]
+            r_parents = [-1]    # Parent index in these lists
+            r_last_cids = [0]   # The CID added at this step
+            r_priorities = [0]
+
             total_items = len(items_half)
             for idx, (cid, credit, gened, mask, order_val) in enumerate(items_half, start=1):
                 if self._cancel_requested:
                     return {}
-                snapshot = list(results.items())
-                for mask0, entry in snapshot:
-                    if mask0 & mask:
+                
+                # Iterate over existing entries by index range to avoid snapshot copy
+                current_count = len(r_masks)
+                for i in range(current_count):
+                    mask0 = r_masks[i]
+                    if mask0 & mask: # Conflict check
                         continue
+                    
                     new_mask = mask0 | mask
-                    new_entry = _HalfEntry(
-                        mask=new_mask,
-                        credit=entry.credit + credit,
-                        gened=entry.gened + gened,
-                        ids=entry.ids + (cid,),
-                        priority_sum=entry.priority_sum + order_val,
-                    )
-                    existing = results.get(new_mask)
-                    if existing is None or better_entry(new_entry, existing):
-                        results[new_mask] = new_entry
+                    new_credit = r_credits[i] + credit
+                    new_gened = r_geneds[i] + gened
+                    new_priority = r_priorities[i] + order_val
+                    
+                    # Check if we should update or add
+                    existing_idx = results_map.get(new_mask)
+                    
+                    # Logic for better entry: higher credit, then lower priority_sum
+                    # Note: Tie-break with order_key is expensive, simplified here for G-01/G-02 speedup
+                    # If strictly needed, we would need to reconstruct ids and compare.
+                    # For P0 optimization, we assume credit > priority is sufficient for pruning dominance.
+                    
+                    if existing_idx is None:
+                        # Add new
+                        results_map[new_mask] = len(r_masks)
+                        r_masks.append(new_mask)
+                        r_credits.append(new_credit)
+                        r_geneds.append(new_gened)
+                        r_parents.append(i)
+                        r_last_cids.append(cid)
+                        r_priorities.append(new_priority)
+                    else:
+                        # Compare with existing
+                        old_credit = r_credits[existing_idx]
+                        old_priority = r_priorities[existing_idx]
+                        
+                        replace = False
+                        if new_credit > old_credit:
+                            replace = True
+                        elif new_credit == old_credit:
+                            if new_priority < old_priority:
+                                replace = True
+                            elif new_priority == old_priority:
+                                # Tie-break: compare ids order keys
+                                # This is the expensive part (G-04), only do if necessary
+                                new_ids = reconstruct_ids(i, r_parents, r_last_cids) + (cid,)
+                                old_ids = reconstruct_ids(existing_idx, r_parents, r_last_cids)
+                                if order_key_for_ids(new_ids) < order_key_for_ids(old_ids):
+                                    replace = True
+                        
+                        if replace:
+                            r_credits[existing_idx] = new_credit
+                            r_geneds[existing_idx] = new_gened
+                            r_parents[existing_idx] = i
+                            r_last_cids[existing_idx] = cid
+                            r_priorities[existing_idx] = new_priority
+
                 if total_items > 0:
                     pct = progress_start + int(progress_span * (idx / total_items))
                     self._emit_progress(pct)
-            return results
+            
+            # Convert back to dict of objects or tuples for the next stage
+            # To minimize change in next stage, we return a dict mapping mask -> _HalfEntry-like tuple
+            final_results = {}
+            for i in range(len(r_masks)):
+                m = r_masks[i]
+                final_results[m] = _HalfEntry(
+                    mask=m,
+                    credit=r_credits[i],
+                    gened=r_geneds[i],
+                    ids=reconstruct_ids(i, r_parents, r_last_cids),
+                    priority_sum=r_priorities[i]
+                )
+            return final_results
 
         left_map = enumerate_half(left_items, 0, 40)
         if self._cancel_requested:

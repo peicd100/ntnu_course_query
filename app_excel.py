@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
 
-from app_constants import COURSE_SHEET_CANDIDATES, REQUIRED_COLUMNS
+from app_constants import COURSE_SHEET_CANDIDATES, REQUIRED_COLUMNS, TEACHING_NAME_TOKEN, SPORT_DEPT_NAME, GENED_CORE_OPTIONS
 from app_utils import (
     parse_cid_to_int,
     parse_time_text,
@@ -17,6 +17,7 @@ from app_utils import (
     format_cid4,
     _slot_sort_key,
     parse_gened_categories_from_course_name,
+    strip_bracket_text_for_timetable,
 )
 
 
@@ -80,10 +81,14 @@ def ensure_excel_readable(excel_path: str) -> str:
 
     if ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
         try:
-            wb = load_workbook(excel_path, data_only=True)
-            if not wb.sheetnames:
-                raise ExcelFormatError("Workbook 沒有任何工作表。")
-            return excel_path
+            # H-02: Use read_only=True for lighter memory usage during check
+            wb = load_workbook(excel_path, read_only=True, data_only=True)
+            try:
+                if not wb.sheetnames:
+                    raise ExcelFormatError("Workbook 沒有任何工作表。")
+                return excel_path
+            finally:
+                wb.close()
         except Exception:
             patched = _patch_xlsx_namespaces_inplace(excel_path)
             if not patched:
@@ -146,6 +151,13 @@ def _build_courses_df_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
     df["_mask_lo"] = [np.uint64(t[0]) for t in masks]
     df["_mask_hi"] = [np.uint64(t[1]) for t in masks]
 
+    # Precompute timetable label (D-02)
+    # _tt_label = strip(中文課名) + "\n" + cid4
+    tt_labels = []
+    for cname, cid_str in zip(df["中文課程名稱"], df["開課序號"]):
+        tt_labels.append(f"{strip_bracket_text_for_timetable(str(cname).strip())}\n{cid_str}")
+    df["_tt_label"] = tt_labels
+
     # Cache gened parsing to reduce repeated regex work
     gened_cache = {}
     gened_results = []
@@ -157,6 +169,34 @@ def _build_courses_df_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
             gened_cache[key] = res
         gened_results.append(res)
     df["_gened_cats"] = gened_results
+
+    # B-04: Precompute gened core mask (uint32)
+    # Map each core option to a bit position
+    core_map = {name: (1 << i) for i, name in enumerate(GENED_CORE_OPTIONS)}
+    gened_masks = []
+    for cats in gened_results:
+        mask = 0
+        for c in cats:
+            if c in core_map:
+                mask |= core_map[c]
+        gened_masks.append(mask)
+    df["_gened_mask"] = np.array(gened_masks, dtype=np.uint32)
+
+    # Precompute boolean fields for search (B-05)
+    if "中文課程名稱" in df.columns:
+        df["_is_teaching"] = df["中文課程名稱"].astype(str).str.contains(TEACHING_NAME_TOKEN, na=False)
+    else:
+        df["_is_teaching"] = False
+
+    if "系所" in df.columns:
+        df["_is_sport"] = (df["系所"] == SPORT_DEPT_NAME)
+    else:
+        df["_is_sport"] = False
+
+    if "限修人數" in df.columns and "選修人數" in df.columns:
+        df["_not_full"] = (df["限修人數"].notna()) & (df["選修人數"].notna()) & (df["選修人數"] < df["限修人數"])
+    else:
+        df["_not_full"] = False
 
     # Precompute lowercased fields for faster search (kept as internal columns)
     if "開課代碼" in df.columns:
@@ -177,7 +217,9 @@ def _build_courses_df_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
     
     df["_alltext"] = all_text_series.str.lower()
 
-    return df.reset_index(drop=True)
+    # D-03: Sort by _cid to enable O(k log n) lookup in subset operations
+    # This ensures the dataframe is physically sorted by course ID
+    return df.sort_values("_cid", kind="mergesort").reset_index(drop=True)
 
 
 def load_courses_auto(excel_path: str) -> Tuple[pd.DataFrame, str]:
@@ -194,6 +236,11 @@ def load_courses_auto(excel_path: str) -> Tuple[pd.DataFrame, str]:
 
     for s in ordered:
         try:
+            # H-01: Read header only first to check columns
+            cols = pd.read_excel(excel_path, sheet_name=s, nrows=0).columns
+            if any(c not in cols for c in REQUIRED_COLUMNS):
+                continue
+            
             raw = pd.read_excel(excel_path, sheet_name=s)
             if any(c not in raw.columns for c in REQUIRED_COLUMNS):
                 continue

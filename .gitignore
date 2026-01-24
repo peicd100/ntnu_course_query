@@ -1,5 +1,15 @@
-dist/
-build/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 
+# Virtual Environment
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# User Data (Local only)
+user_data/

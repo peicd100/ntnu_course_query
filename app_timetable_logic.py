@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 from PySide6.QtGui import QColor
 
-from app_constants import DAY_LABEL, DAYS, PERIODS, PERIOD_INDEX
-from app_utils import strip_bracket_text_for_timetable, format_cid4
+from app_constants import DAY_LABEL, PERIODS, PERIOD_INDEX
+from app_utils import format_cid4, strip_bracket_text_for_timetable
 
 
 def darken(color: QColor, factor: float) -> QColor:
@@ -27,10 +27,29 @@ def _subset_courses_by_ids(
 
     ids = included_ids_sorted.astype(np.int64, copy=False)
     cid_arr = courses_df["_cid"].to_numpy(dtype=np.int64, copy=False)
-    mask = np.isin(cid_arr, ids)
-    if not mask.any():
+    
+    # D-03: Use searchsorted for O(k log n) lookup
+    # We assume courses_df is sorted by _cid (ensured in app_excel.py)
+    # Check if cid_arr is actually sorted (cheap check for first/last or just assume)
+    # Since we control app_excel, we assume it is sorted.
+    
+    indices = np.searchsorted(cid_arr, ids)
+    
+    # Filter out indices that are out of bounds or don't match (id not found)
+    valid_mask = (indices < len(cid_arr))
+    if not valid_mask.all():
+        indices = indices[valid_mask]
+        ids = ids[valid_mask]
+    
+    # Double check matches
+    if len(indices) > 0:
+        matched_mask = (cid_arr[indices] == ids)
+        indices = indices[matched_mask]
+    
+    if len(indices) == 0:
         return courses_df.iloc[0:0][cols]
-    return courses_df.loc[mask, cols]
+        
+    return courses_df.iloc[indices][cols]
 
 
 def occupied_masks_sorted(courses_df: pd.DataFrame, included_ids_sorted: np.ndarray) -> Tuple[np.uint64, np.uint64]:
@@ -47,6 +66,38 @@ def occupied_masks_sorted(courses_df: pd.DataFrame, included_ids_sorted: np.ndar
     return np.uint64(occ_lo), np.uint64(occ_hi)
 
 
+def occupied_masks_from_arrays(
+    mask_lo_arr: np.ndarray, mask_hi_arr: np.ndarray, cid_arr: np.ndarray, included_ids_sorted: np.ndarray
+) -> Tuple[np.uint64, np.uint64]:
+    # F-01: Use searchsorted on sorted arrays
+    if included_ids_sorted.size == 0 or cid_arr.size == 0:
+        return np.uint64(0), np.uint64(0)
+
+    # F-01: Use searchsorted for O(k log n) lookup
+    # cid_arr is sorted (ensured by MainWindow._build_course_binary_index)
+    indices = np.searchsorted(cid_arr, included_ids_sorted)
+    
+    # Filter indices that are out of bounds
+    valid_mask = (indices < len(cid_arr))
+    if not valid_mask.all():
+        indices = indices[valid_mask]
+        included_ids_sorted = included_ids_sorted[valid_mask]
+        
+    if indices.size == 0:
+        return np.uint64(0), np.uint64(0)
+
+    # Check exact matches (searchsorted finds insertion point)
+    matched_mask = (cid_arr[indices] == included_ids_sorted)
+    final_indices = indices[matched_mask]
+    
+    if final_indices.size == 0:
+        return np.uint64(0), np.uint64(0)
+
+    occ_lo = np.bitwise_or.reduce(mask_lo_arr[final_indices])
+    occ_hi = np.bitwise_or.reduce(mask_hi_arr[final_indices])
+    return np.uint64(occ_lo), np.uint64(occ_hi)
+
+
 def build_lane_assignment_sorted(courses_df: pd.DataFrame, included_ids_sorted: np.ndarray) -> Tuple[Dict[int, int], int]:
     if included_ids_sorted is None or included_ids_sorted.size == 0:
         return {}, 1
@@ -58,10 +109,19 @@ def build_lane_assignment_sorted(courses_df: pd.DataFrame, included_ids_sorted: 
     lane_of: Dict[int, int] = {}
     max_lane = 1
 
-    rows = list(sub.itertuples(index=False, name=None))
-    rows.sort(key=lambda x: (-(len(x[1]) if isinstance(x[1], set) else 0), int(x[0])))
+    # D-04: Avoid itertuples for performance
+    cids = sub["_cid"].to_numpy()
+    slots_col = sub["_slots_set"].to_numpy()
+    
+    # Prepare data for sorting: (len_slots desc, cid asc)
+    data = []
+    for cid, slots in zip(cids, slots_col):
+        l = len(slots) if isinstance(slots, set) else 0
+        data.append((l, cid, slots))
+    
+    data.sort(key=lambda x: (-x[0], x[1]))
 
-    for cid, slots in rows:
+    for _, cid, slots in data:
         cid_i = int(cid)
         slots_set = slots if isinstance(slots, set) else set()
         if not slots_set:
@@ -107,10 +167,14 @@ def build_timetable_matrix_per_day_lanes_sorted(
     subset_meta = _subset_courses_by_ids(
         courses_df,
         included_ids_sorted,
-        ["_cid", "中文課程名稱", "_slots_set"],
+        ["_cid", "中文課程名稱", "_slots_set", "_tt_label"],
     )
 
-    for cid, _cname, slots in subset_meta.itertuples(index=False, name=None):
+    # D-04: Pre-fetch columns to avoid DataFrame overhead in loops
+    meta_cids = subset_meta["_cid"].to_numpy()
+    meta_slots = subset_meta["_slots_set"].to_numpy()
+
+    for cid, slots in zip(meta_cids, meta_slots):
         cid_i = int(cid)
         lane = lane_map.get(cid_i, 1)
         slots_set = slots if isinstance(slots, set) else set()
@@ -136,10 +200,28 @@ def build_timetable_matrix_per_day_lanes_sorted(
 
     locked_ids_set = set(int(x) for x in locked_ids_set)
 
-    for cid, cname, slots in subset_meta.itertuples(index=False, name=None):
+    # D-02: Use precomputed _tt_label if available
+    has_tt_label = "_tt_label" in subset_meta.columns
+    meta_labels = subset_meta["_tt_label"].to_numpy() if has_tt_label else None
+    meta_cnames = subset_meta["中文課程名稱"].to_numpy() if not has_tt_label else None
+
+    if has_tt_label:
+        iterator = zip(meta_cids, meta_slots, meta_labels)
+    else:
+        iterator = zip(meta_cids, meta_slots, meta_cnames)
+
+    for item in iterator:
+        cid = item[0]
+        slots = item[1]
         cid_i = int(cid)
-        cname_show = strip_bracket_text_for_timetable(str(cname).strip())
-        label = f"{cname_show}\n{format_cid4(cid_i)}".strip()
+        
+        if has_tt_label:
+            label = str(item[2])
+        else:
+            # Fallback
+            cname = item[2]
+            cname_show = strip_bracket_text_for_timetable(str(cname).strip())
+            label = f"{cname_show}\n{format_cid4(cid_i)}".strip()
 
         slots_set = slots if isinstance(slots, set) else set()
         lane = lane_map.get(cid_i, 1)
@@ -150,7 +232,8 @@ def build_timetable_matrix_per_day_lanes_sorted(
             if day not in day_offset or per not in PERIOD_INDEX:
                 continue
 
-            r = PERIODS.index(per)
+            # D-01: Use PERIOD_INDEX
+            r = PERIOD_INDEX[per]
             c = day_offset[day] + (lane - 1)
 
             if matrix[r][c] and label not in matrix[r][c]:

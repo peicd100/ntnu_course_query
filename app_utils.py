@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import List, Optional, Set, Tuple
 
 import numpy as np
@@ -9,6 +10,15 @@ import pandas as pd
 
 from app_constants import BITS_PER_DAY, DAY_INDEX, DAYS, PERIOD_INDEX, PERIODS
 
+
+# Pre-compile regex patterns for performance
+_RE_DIGITS = re.compile(r"\d+")
+_RE_BRACKET_SQ_STRIP = re.compile(r"\[.*?\]")
+_RE_BRACKET_FW_STRIP = re.compile(r"【.*?】")
+_RE_BRACKET_SQ_CONTENT = re.compile(r"\[(.*?)\]")
+_RE_BRACKET_FW_CONTENT = re.compile(r"【(.*?)】")
+_RE_SPACE = re.compile(r"\s+")
+_RE_SPLIT_SEMI = re.compile(r"[；;]")
 
 @dataclass
 class ParsedTime:
@@ -30,7 +40,7 @@ def parse_cid_to_int(val) -> Optional[int]:
     s = str(val).strip()
     if not s:
         return None
-    m = re.search(r"\d+", s)
+    m = _RE_DIGITS.search(s)
     if not m:
         return None
     try:
@@ -41,9 +51,9 @@ def parse_cid_to_int(val) -> Optional[int]:
 
 def strip_bracket_text_for_timetable(name: str) -> str:
     s = str(name or "")
-    s = re.sub(r"\[.*?\]", "", s)
-    s = re.sub(r"【.*?】", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = _RE_BRACKET_SQ_STRIP.sub("", s)
+    s = _RE_BRACKET_FW_STRIP.sub("", s)
+    s = _RE_SPACE.sub(" ", s).strip()
     return s
 
 
@@ -53,6 +63,7 @@ def sorted_array_from_set_int(s: Set[int]) -> np.ndarray:
     return np.array(sorted((int(x) for x in s)), dtype=np.int64)
 
 
+@lru_cache(maxsize=None)
 def slot_to_mask(day: str, period: str) -> Tuple[np.uint64, np.uint64]:
     if day not in DAY_INDEX:
         return np.uint64(0), np.uint64(0)
@@ -190,8 +201,8 @@ def parse_gened_categories_from_course_name(course_name: str) -> List[str]:
     if not s:
         return []
 
-    matches_sq = list(re.finditer(r"\[(.*?)\]", s))
-    matches_fw = list(re.finditer(r"【(.*?)】", s))
+    matches_sq = list(_RE_BRACKET_SQ_CONTENT.finditer(s))
+    matches_fw = list(_RE_BRACKET_FW_CONTENT.finditer(s))
 
     picked = None
     if matches_sq and matches_fw:
@@ -208,7 +219,7 @@ def parse_gened_categories_from_course_name(course_name: str) -> List[str]:
     if not inner:
         return []
 
-    parts = [p.strip() for p in re.split(r"[；;]", inner) if p.strip()]
+    parts = [p.strip() for p in _RE_SPLIT_SEMI.split(inner) if p.strip()]
     if not parts:
         return []
 
@@ -220,7 +231,7 @@ def parse_gened_categories_from_course_name(course_name: str) -> List[str]:
     else:
         tail = last.strip()
 
-    tail = re.sub(r"\s+", " ", tail).strip()
+    tail = _RE_SPACE.sub(" ", tail).strip()
     if not tail:
         return []
 

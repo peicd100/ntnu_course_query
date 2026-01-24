@@ -236,9 +236,8 @@ def save_user_file(
 ) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(xlsx_path)), exist_ok=True)
 
-    wb = Workbook()
-    if "Sheet" in wb.sheetnames:
-        wb.remove(wb["Sheet"])
+    # I-02: Use write_only=True for faster writing and lower memory usage
+    wb = Workbook(write_only=True)
 
     items = [(int(fav_seq.get(int(cid), 10**12)), int(cid)) for cid in favorites_ids]
     items.sort(key=lambda x: (x[0], x[1]))
@@ -266,7 +265,8 @@ def save_user_file(
     out_cols = [c for c in courses_df.columns if not str(c).startswith("_")] + ["_tba", "_slots"]
 
     if included_ids_sorted.size:
-        subset = courses_df[courses_df["_cid"].isin([int(x) for x in included_ids_sorted.tolist()])].copy()
+        # I-01: Use isin directly with numpy array
+        subset = courses_df[courses_df["_cid"].isin(included_ids_sorted)].copy()
     else:
         subset = courses_df.iloc[0:0].copy()
 
@@ -281,4 +281,15 @@ def save_user_file(
         for r in dataframe_to_rows(subset[out_cols], index=False, header=False):
             ws_tt.append(r)
 
-    wb.save(xlsx_path)
+    # I-03: Atomic write (write to temp then replace)
+    tmp_path = xlsx_path + ".tmp"
+    try:
+        wb.save(tmp_path)
+        os.replace(tmp_path, xlsx_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise

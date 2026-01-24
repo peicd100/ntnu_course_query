@@ -426,10 +426,14 @@ class ResultsModel(QAbstractTableModel):
 
     def __init__(self, df: pd.DataFrame, favorites_ref: Set[int]):
         super().__init__()
-        self._df = df
+        self._source_df = df
+        self._visible_rows = np.arange(len(df), dtype=np.int32)
+        self._display_columns = [c for c in df.columns if not str(c).startswith("_")]
         self._favorites = favorites_ref
         self._readonly = False
         self._fav_sorted = np.empty((0,), dtype=np.int64)
+        self._cid_col: Optional[np.ndarray] = None
+        self._col_arrays: List[np.ndarray] = [] # C-02: Cache display columns
         self._rebuild_fav_sorted()
 
     def _rebuild_fav_sorted(self) -> None:
@@ -450,18 +454,43 @@ class ResultsModel(QAbstractTableModel):
             bot = self.index(self.rowCount() - 1, 0)
             self.dataChanged.emit(top, bot, [Qt.CheckStateRole])
 
-    def set_df(self, df: pd.DataFrame) -> None:
-        self.beginResetModel()
-        self._df = df
-        self.endResetModel()
+    def set_data_view(self, source_df: pd.DataFrame, visible_rows: Optional[np.ndarray] = None, display_cols: Optional[List[str]] = None) -> None:
+        # B-03: Update view without resetting model if possible, or use layoutChanged
+        self.layoutAboutToBeChanged.emit()
+        
+        self._source_df = source_df
+        
+        if visible_rows is not None:
+            self._visible_rows = visible_rows
+        else:
+            self._visible_rows = np.arange(len(source_df), dtype=np.int32)
+            
+        if display_cols is not None:
+            self._display_columns = display_cols
+        else:
+            self._display_columns = [c for c in source_df.columns if not str(c).startswith("_")]
+
+        # C-02: Cache all display columns as numpy arrays for O(1) access
+        self._col_arrays = []
+        for col in self._display_columns:
+            self._col_arrays.append(self._source_df[col].to_numpy(copy=False))
+
+        # C-01: Cache cid column from source directly (it's immutable usually)
+        # We use _cid (int) for faster lookup if available
+        if "_cid" in self._source_df.columns:
+            self._cid_col = self._source_df["_cid"].to_numpy(dtype=np.int64, copy=False)
+        else:
+            self._cid_col = None
+            
+        self.layoutChanged.emit()
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self._df)
+        return 0 if parent.isValid() else len(self._visible_rows)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
             return 0
-        return len(self._df.columns) + 1
+        return len(self._display_columns) + 1
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
         if role != Qt.DisplayRole:
@@ -469,14 +498,21 @@ class ResultsModel(QAbstractTableModel):
         if orientation == Qt.Horizontal:
             if section == 0:
                 return "我的最愛"
-            return str(self._df.columns[section - 1])
+            return str(self._display_columns[section - 1])
         return str(section + 1)
 
     def _course_id_at_row(self, row: int) -> Optional[int]:
-        if row < 0 or row >= len(self._df):
+        if row < 0 or row >= len(self._visible_rows):
             return None
+        
+        real_row = self._visible_rows[row]
+        
+        # C-01: Use cached array (O(1) lookup)
+        if self._cid_col is not None:
+            return int(self._cid_col[real_row])
+        
         try:
-            v = self._df.iloc[row]["開課序號"]
+            v = self._source_df.iat[real_row, self._source_df.columns.get_loc("開課序號")]
             return int(str(v).strip())
         except Exception:
             return None
@@ -493,8 +529,12 @@ class ResultsModel(QAbstractTableModel):
                 cid = self._course_id_at_row(r)
                 return 1 if (cid is not None and self._fav_has(cid)) else 0
 
-            col_name = self._df.columns[c - 1]
-            v = self._df.iat[r, c - 1]
+            col_name = self._display_columns[c - 1]
+            real_row = self._visible_rows[r]
+            
+            # C-02: Use cached array access
+            # v = self._source_df.at[real_row, col_name]
+            v = self._col_arrays[c - 1][real_row]
 
             if str(col_name) == "開課序號":
                 try:
@@ -524,11 +564,13 @@ class ResultsModel(QAbstractTableModel):
             return None
 
         c2 = c - 1
-        if c2 < 0 or c2 >= len(self._df.columns):
+        if c2 < 0 or c2 >= len(self._display_columns):
             return None
 
         if role in (Qt.DisplayRole, Qt.ToolTipRole):
-            v = self._df.iat[r, c2]
+            # C-02: Use cached array access
+            # col_name = self._display_columns[c2]
+            v = self._col_arrays[c2][self._visible_rows[r]]
             return "" if pd.isna(v) else str(v)
         return None
 

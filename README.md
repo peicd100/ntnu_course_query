@@ -1,180 +1,91 @@
-# 師大課程查詢系統
+# 師大課程查詢與排課系統 (優化版)
 
-## 1. 專案概述
+這是一個基於 Python 與 PySide6 開發的桌面應用程式，專為師大課程查詢與排課設計。本版本經過效能優化，針對大量課程資料的搜尋、篩選與最佳選課運算進行了大幅度的加速。
 
-本專案為桌面 GUI 課程查詢與排課工具。使用者將課程 Excel 檔放入 `user_data/course_inputs/`，程式會讀取資料並輸出排課結果至 `user_data/user_schedules/`。
+## 主要功能
 
-## 2. 重要變數
+*   **極速搜尋**：支援開課序號、代碼、課名、教師、系所等多條件即時篩選。
+*   **智慧排課**：視覺化課表，支援拖曳選取時段、排除衝堂、排除已選。
+*   **最佳選課**：根據我的最愛、優先順序與鎖定課程，自動計算學分最大化且符合志願序的最佳組合。
+*   **資料管理**：支援多使用者設定檔、歷史紀錄回溯、Excel 匯出、PDF 課表匯出。
 
-- ENV_NAME：`ntnu_course_query`（英文小寫+底線；亦作為 GitHub repository 命名依據）
-- EXE_NAME：`師大課程查詢系統`（workspace root 資料夾名稱 basename；亦作為 .exe 命名依據）
+## 本次優化與更新內容 (Changelog)
 
-## 3. workspace root 定義
+### 1. 效能優化 (Performance)
+*   **搜尋加速**：
+    *   實作 **簽名快取 (Signature Cache)**，避免重複運算。
+    *   **向量化篩選**：將通識、滿額等條件改為預先計算的布林/位元遮罩。
+    *   **稀疏矩陣優化**：針對文字搜尋（課名/教師）實作子集掃描策略。
+    *   **ID 查找優化**：使用 `searchsorted` (O(k log n)) 取代 `isin`。
+*   **零複製 (Zero-Copy)**：搜尋結果改用 Row-index mapping，不再複製 DataFrame，降低記憶體壓力。
+*   **最佳選課演算法**：
+    *   改用 **平行 List** 與 **Parent Pointer** 回溯，減少物件建立。
+    *   實作 **Mask 去重 (Pruning)**，提早排除劣解。
+*   **UI 渲染**：
+    *   課表繪製重用 `QTableWidgetItem` 與快取 Brush/Color。
+    *   結果列表使用 Numpy Array 快取欄位資料。
+    *   **渲染資源預計算**：預先建立課表背景 Brush，減少重繪時的物件建立。
+    *   **工具函式快取**：`slot_to_mask` 加入 LRU Cache，加速 Excel 載入與遮罩計算。
+*   **資料 I/O**：
+    *   Excel 載入優化（Header 預讀）。
+    *   存檔使用 `write_only` 模式與 **原子寫入 (Atomic Save)**。
 
-- workspace root（絕對路徑）：`D:\x1064\PEICD100\0_python\1_師大課程查詢系統\1_師大課程查詢系統_測試版\師大課程查詢系統`
-- EXE_NAME 為上述資料夾名稱 basename。
-- README 內所有相對路徑均以 workspace root 為準。
+### 2. 新增功能 (New Features)
+*   **PDF 匯出**：支援匯出 A4 直向課表，自動縮放填滿頁面。
+*   **High DPI 支援**：優化高解析度螢幕顯示。
+*   **關於視窗**：新增版本與開發者資訊說明。
 
-## 4. 檔案與資料夾結構（樹狀；最小必要集合）
+### 3. 基礎建設 (Infrastructure)
+*   **CI/CD**：新增 GitHub Actions 自動測試與打包流程。
+*   **單元測試**：新增 `test_timetable_logic.py` 驗證核心邏輯。
+*   **啟動優化**：延遲 Excel 載入，提升視窗顯示速度。
 
-```
-師大課程查詢系統/
-├─ README.md
-├─ app_main.py
-├─ app_constants.py
-├─ app_excel.py
-├─ app_mainwindow.py
-├─ app_timetable_logic.py
-├─ app_user_data.py
-├─ app_utils.py
-├─ app_widgets.py
-├─ app_workers.py
-├─ user_data/
-│  ├─ course_inputs/
-│  │  └─ *.xls / *.xlsx
-│  └─ user_schedules/
-│     └─ <username>/
-│        ├─ history/
-│        │  └─ <YYYYMMDD_HHMMSS>.xlsx
-│        └─ best_schedule/
-│           ├─ <最佳課表>_第<序號>.xlsx
-│           └─ best_schedule_cache.json
-├─ dist/
-└─ build/
-```
+## 環境需求
 
-- 專案輸入檔案存放位置：`user_data/course_inputs/`
-- 專案輸出檔案存放位置：`user_data/user_schedules/<username>/history/`、`user_data/user_schedules/<username>/best_schedule/`
+*   Windows 10/11 (建議)
+*   Python 3.8+
 
-## 5. Python 檔名規則（app_main.py + app_*.py 同層）
+## 安裝與執行
 
-- 入口檔：`app_main.py`
-- 其餘模組：`app_*.py`，與 `app_main.py` 同層
-- 不新增其他入口檔
+### 1. 安裝依賴套件
 
-## 6. user_data/ 規範
+請在專案根目錄執行：
 
-- 所有輸入/輸出/設定預設放在 `user_data/`
-- 課程輸入：`user_data/course_inputs/`（`.xls` / `.xlsx`）
-- 排課輸出：`user_data/user_schedules/<username>/history/`
-- 最佳課表：`user_data/user_schedules/<username>/best_schedule/`
-- 執行 `.exe` 時，`user_data/` 需與 `.exe` 同層放置
-
-## 7. Conda 環境（ENV_NAME）規範
-
-- 僅使用 `ntnu_course_query` 作為專案環境名稱
-- 禁止對 base 環境 install/remove
-- 套件安裝以 conda 為主；只有在 conda 不可行時才使用 pip
-- pip 必須在已啟用 `ntnu_course_query` 的情況下執行
-
-## 8. 從零開始安裝流程（可一鍵複製；註解不得同列命令）
-
-目標 shell：Windows CMD。
-
-A. 推薦方案（conda 優先）
-
-```
-conda create -n ntnu_course_query python=3.10 -y
-call "C:\ProgramData\Anaconda3\Scripts\activate.bat" "C:\ProgramData\Anaconda3" && conda activate base && conda activate ntnu_course_query
-conda install -c conda-forge pyside6 numpy pandas openpyxl xlrd pyinstaller -y
-python -c "import PySide6, numpy, pandas, openpyxl, xlrd; import app_main; print('OK')" && python app_main.py
+```bash
+pip install -r requirements.txt
 ```
 
-B. 備援方案（conda + pip）
+### 2. 執行程式
 
-若 conda 的 PySide6 在本機無法取得或版本不相容，改以 pip 安裝 PySide6。
-
-```
-conda create -n ntnu_course_query python=3.10 -y
-call "C:\ProgramData\Anaconda3\Scripts\activate.bat" "C:\ProgramData\Anaconda3" && conda activate base && conda activate ntnu_course_query
-conda install -c conda-forge numpy pandas openpyxl xlrd pyinstaller -y
-pip install PySide6
-python -c "import PySide6, numpy, pandas, openpyxl, xlrd; import app_main; print('OK')" && python app_main.py
-```
-
-C. 最後手段（pip only）
-
-```
-conda create -n ntnu_course_query python=3.10 -y
-call "C:\ProgramData\Anaconda3\Scripts\activate.bat" "C:\ProgramData\Anaconda3" && conda activate base && conda activate ntnu_course_query
-pip install PySide6 numpy pandas openpyxl xlrd pyinstaller
-python -c "import PySide6, numpy, pandas, openpyxl, xlrd; import app_main; print('OK')" && python app_main.py
-```
-
-建議使用 A 方案，因為相容性與安裝成功率最佳，且本專案無需 GPU 版套件。
-
-## 9. 測試方式
-
-基本啟動測試（GUI 會短暫啟動後自動關閉）：
-
-```
-python app_main.py --smoke-test
-```
-
-手動測試（正常啟動 GUI）：
-
-```
+```bash
 python app_main.py
 ```
 
-## 10. 打包成 .exe（可複製指令）
+### 3. 執行單元測試
 
-在 `ntnu_course_query` 環境內執行：
+為確保核心邏輯正確，可執行以下指令跑測試：
 
-```
-call "C:\ProgramData\Anaconda3\Scripts\activate.bat" "C:\ProgramData\Anaconda3" && conda activate base && conda activate ntnu_course_query
-pyinstaller --noconsole --onedir --name "師大課程查詢系統" app_main.py -y
-```
-
-輸出位置：
-
-- `dist/師大課程查詢系統/師大課程查詢系統.exe`
-
-若要在未安裝 Python/Conda 的環境使用 `.exe`，請將 `user_data/` 放在 `.exe` 同層。
-
-## 11. 使用者要求
-
-- README 必須維持本文件之章節規範與凍結區塊
-- 所有輸入/輸出/設定預設放在 `user_data/`
-- 禁止修改系統設定或全域安裝
-- Git 操作僅提供指令範例，實際操作由使用者執行
-
-## 12. GitHub操作指令
-
-# 初始化
-```
-(
-echo.
-echo # ignore build outputs
-echo dist/
-echo build/
-)>> .gitignore
-git init
-git branch -M main
-git remote add origin https://github.com/peicd100/ntnu_course_query.git
-git add .
-git commit -m "PEICD100"
-git push -u origin main
+```bash
+python -m unittest test_timetable_logic.py
 ```
 
-# 例行上傳
-```
-git add .
-git commit -m "PEICD100"
-git push -u origin main
+## 打包成執行檔 (EXE)
+
+本專案已包含 PyInstaller 設定檔 (`main.spec`) 與自動化腳本 (`build.bat`)。
+
+### 方法 A：使用批次檔 (推薦)
+
+直接雙擊執行 `build.bat`，它會自動安裝依賴、執行測試並進行打包。
+
+### 方法 B：手動打包
+
+```bash
+pyinstaller main.spec --clean --noconfirm
 ```
 
-# 還原成Git Hub最新資料
-```
-git rebase --abort || echo "No rebase in progress" && git fetch origin && git switch main && git reset --hard origin/main && git clean -fd && git status
-```
+打包完成後，執行檔將位於 `dist\師大課程查詢系統\師大課程查詢系統.exe`。
 
-# 查看儲存庫
-```
-git remote -v
-```
+## 使用說明
 
-# 克隆儲存庫
-```
-git clone https://github.com/peicd100/ntnu_course_query.git
-```
+1.  啟動程式後，請先透過「檔案 -> 開啟課程 Excel」載入學校課程資料表。
+2.  建立或選擇使用者後，即可開始使用搜尋與排課功能。
