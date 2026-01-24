@@ -434,6 +434,7 @@ class ResultsModel(QAbstractTableModel):
         self._fav_sorted = np.empty((0,), dtype=np.int64)
         self._cid_col: Optional[np.ndarray] = None
         self._col_arrays: List[np.ndarray] = [] # C-02: Cache display columns
+        self._cid_col_idx: int = -1
         self._rebuild_fav_sorted()
 
     def _rebuild_fav_sorted(self) -> None:
@@ -483,8 +484,12 @@ class ResultsModel(QAbstractTableModel):
         if cache_dirty:
             # C-02: Cache all display columns as numpy arrays for O(1) access
             self._col_arrays = []
-            for col in self._display_columns:
+            self._cid_col_idx = -1
+            for i, col in enumerate(self._display_columns):
                 self._col_arrays.append(self._source_df[col].to_numpy(copy=False))
+                # Cache the index of the course ID column to avoid string comparison in data()
+                if str(col) == "開課序號":
+                    self._cid_col_idx = i
 
             # C-01: Cache cid column from source directly (it's immutable usually)
             # We use _cid (int) for faster lookup if available
@@ -540,14 +545,14 @@ class ResultsModel(QAbstractTableModel):
                 cid = self._course_id_at_row(r)
                 return 1 if (cid is not None and self._fav_has(cid)) else 0
 
-            col_name = self._display_columns[c - 1]
+            col_idx = c - 1
             real_row = self._visible_rows[r]
             
             # C-02: Use cached array access
-            # v = self._source_df.at[real_row, col_name]
-            v = self._col_arrays[c - 1][real_row]
+            # v = self._source_df.at[real_row, col_name] # Old way
+            v = self._col_arrays[col_idx][real_row]
 
-            if str(col_name) == "開課序號":
+            if col_idx == self._cid_col_idx:
                 try:
                     return int(str(v).strip())
                 except Exception:

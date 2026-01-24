@@ -233,6 +233,7 @@ class MainWindow(QMainWindow):
         self._not_full_arr: Optional[np.ndarray] = None
         self._gened_mask_arr: Optional[np.ndarray] = None
         self._slots_by_cid: Dict[int, Set[str]] = {}
+        self._parsed_slots_by_cid: Dict[int, List[Tuple[str, str]]] = {}
 
         self._search_timer = QTimer(self)
         self._last_search_signature: Optional[Tuple] = None # B-07: Search signature cache
@@ -925,6 +926,7 @@ class MainWindow(QMainWindow):
             self._not_full_arr = None
             self._gened_mask_arr = None
             self._slots_by_cid = {}
+            self._parsed_slots_by_cid = {}
             self._last_search_signature = None
             return
 
@@ -951,7 +953,9 @@ class MainWindow(QMainWindow):
             self._dept_arr = self.courses_df["系所"].to_numpy(dtype=object, copy=False)
         else:
             self._dept_arr = None
+            
         self._slots_by_cid = {}
+        self._parsed_slots_by_cid = {}
         for cid, slots in zip(self.courses_df["_cid"].tolist(), self.courses_df["_slots_set"].tolist()):
             try:
                 cid_i = int(cid)
@@ -959,6 +963,13 @@ class MainWindow(QMainWindow):
                 continue
             if isinstance(slots, set):
                 self._slots_by_cid[cid_i] = slots
+                parsed = []
+                for s in slots:
+                    if isinstance(s, str) and "-" in s:
+                        parts = s.split("-", 1)
+                        if len(parts) == 2:
+                            parsed.append((parts[0], parts[1]))
+                self._parsed_slots_by_cid[cid_i] = parsed
 
     def _load_excel(self, path: str) -> None:
         ensure_excel_readable(path)
@@ -2872,6 +2883,16 @@ class MainWindow(QMainWindow):
         slots: Set[Tuple[str, str]] = set()
         if self.courses_df is None or not ids:
             return slots
+        
+        # Use parsed cache if available for faster collection
+        if self._parsed_slots_by_cid:
+            for cid in ids:
+                cid_i = int(cid)
+                parsed = self._parsed_slots_by_cid.get(cid_i)
+                if parsed:
+                    slots.update(parsed)
+            return slots
+
         if self._slots_by_cid:
             for cid in ids:
                 try:
