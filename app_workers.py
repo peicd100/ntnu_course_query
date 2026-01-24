@@ -239,6 +239,58 @@ class BestScheduleWorker(QObject, QRunnable):
                 curr = parents[curr]
             return tuple(reversed(path))
 
+        def enumerate_half_beam(
+            items_half: List[Tuple[int, float, int, int, int]],
+            progress_start: int,
+            progress_span: int,
+            limit: int = 200000
+        ) -> Dict[int, _HalfEntry]:
+            # Beam Search implementation for large datasets
+            # Uses tuples for ids to allow easy pruning/reordering
+            # State: mask -> _HalfEntry
+            results: Dict[int, _HalfEntry] = {
+                0: _HalfEntry(mask=0, credit=0.0, gened=0, ids=(), priority_sum=0)
+            }
+            
+            total_items = len(items_half)
+            for idx, (cid, credit, gened, mask, order_val) in enumerate(items_half, start=1):
+                if self._cancel_requested:
+                    return {}
+                
+                # Snapshot current results to iterate
+                current_entries = list(results.values())
+                
+                for entry in current_entries:
+                    if entry.mask & mask:
+                        continue
+                    
+                    new_mask = entry.mask | mask
+                    new_entry = _HalfEntry(
+                        mask=new_mask,
+                        credit=entry.credit + credit,
+                        gened=entry.gened + gened,
+                        ids=entry.ids + (cid,),
+                        priority_sum=entry.priority_sum + order_val
+                    )
+                    
+                    existing = results.get(new_mask)
+                    if existing is None or better_entry(new_entry, existing):
+                        results[new_mask] = new_entry
+                
+                # Prune if too large
+                if len(results) > limit:
+                    # Keep top entries based on credit (desc) and priority (asc)
+                    all_entries = list(results.values())
+                    # Sort key: higher credit is better, lower priority_sum is better
+                    all_entries.sort(key=lambda x: (-x.credit, x.priority_sum))
+                    results = {e.mask: e for e in all_entries[:limit]}
+
+                if total_items > 0:
+                    pct = progress_start + int(progress_span * (idx / total_items))
+                    self._emit_progress(pct)
+            
+            return results
+
         def enumerate_half(
             items_half: List[Tuple[int, float, int, int, int]],
             progress_start: int,
@@ -248,6 +300,11 @@ class BestScheduleWorker(QObject, QRunnable):
             # G-02: Use tuple instead of _HalfEntry object to reduce overhead
             # G-03: Use parent pointers to avoid creating tuples in the loop
             # State: mask -> (credit, gened, ids, priority_sum)
+            
+            # If items are too many, switch to Beam Search to avoid OOM
+            # Threshold 22: 2^22 ~ 4M states, manageable. 2^23 ~ 8M, pushing it.
+            if len(items_half) > 22:
+                return enumerate_half_beam(items_half, progress_start, progress_span)
             
             # Initialize with empty state
             # results_map maps mask -> index in parallel lists

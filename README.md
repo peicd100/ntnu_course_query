@@ -23,6 +23,7 @@
 *   **最佳選課演算法**：
     *   改用 **平行 List** 與 **Parent Pointer** 回溯，減少物件建立。
     *   實作 **Mask 去重 (Pruning)**，提早排除劣解。
+    *   **Beam Search**：當候選課程過多時，自動切換為束搜索模式，防止記憶體溢出。
 *   **UI 渲染**：
     *   課表繪製重用 `QTableWidgetItem` 與快取 Brush/Color。
     *   **重繪優化**：課表更新時檢查顏色狀態，避免不必要的 `setBackground` 呼叫。

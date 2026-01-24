@@ -2957,7 +2957,8 @@ class MainWindow(QMainWindow):
             brush = self._brush_cache_base[day_idx % len(self._brush_cache_base)]
             header_item = widget.horizontalHeaderItem(c)
             if header_item is not None:
-                header_item.setBackground(brush)
+                if header_item.background() != brush:
+                    header_item.setBackground(brush)
 
         black_bg = self._brush_black
         white_fg = self._brush_white
@@ -3051,9 +3052,11 @@ class MainWindow(QMainWindow):
             self._tt_col_day_idx = list(col_day_idx)
             self._rebuild_tt_first_lane_cols()
             self._tt_locked_matrix = locked_matrix
-
-        widget.setRowCount(len(PERIODS))
-        widget.setColumnCount(cols)
+        
+        if widget.rowCount() != len(PERIODS):
+            widget.setRowCount(len(PERIODS))
+        if widget.columnCount() != cols:
+            widget.setColumnCount(cols)
 
         headers: List[str] = []
         for d in self.show_days:
