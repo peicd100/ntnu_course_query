@@ -166,8 +166,8 @@ class MainWindow(QMainWindow):
         self.show_saturday = False
         self.show_time = False
         self.show_days: List[str] = self._calc_show_days()
-        self._slot_mask_lo: List[List[np.uint64]] = []
-        self._slot_mask_hi: List[List[np.uint64]] = []
+        self._slot_mask_lo: np.ndarray = np.empty((0, 0), dtype=np.uint64)
+        self._slot_mask_hi: np.ndarray = np.empty((0, 0), dtype=np.uint64)
         self._rebuild_slot_masks()
 
         self._tt_col_day_idx: List[int] = []
@@ -1055,17 +1055,20 @@ class MainWindow(QMainWindow):
 
     def _rebuild_slot_masks(self) -> None:
         self.show_days = self._calc_show_days()
-        self._slot_mask_lo = []
-        self._slot_mask_hi = []
+        masks_lo = []
+        masks_hi = []
         for d in self.show_days:
             row_lo = []
             row_hi = []
             for p in PERIODS:
                 mlo, mhi = slot_to_mask(d, p)
-                row_lo.append(np.uint64(mlo))
-                row_hi.append(np.uint64(mhi))
-            self._slot_mask_lo.append(row_lo)
-            self._slot_mask_hi.append(row_hi)
+                row_lo.append(mlo)
+                row_hi.append(mhi)
+            masks_lo.append(row_lo)
+            masks_hi.append(row_hi)
+        # Transpose to (periods, days) for easier slicing
+        self._slot_mask_lo = np.array(masks_lo, dtype=np.uint64).T
+        self._slot_mask_hi = np.array(masks_hi, dtype=np.uint64).T
 
     def _clear_saturday_selection_bits(self) -> None:
         lo = np.uint64(self._sel_lo)
@@ -1086,8 +1089,8 @@ class MainWindow(QMainWindow):
     def tt_is_time_selected(self, day_idx: int, row: int) -> bool:
         if not (0 <= day_idx < len(self.show_days) and 0 <= row < len(PERIODS)):
             return False
-        mlo = self._slot_mask_lo[day_idx][row]
-        mhi = self._slot_mask_hi[day_idx][row]
+        mlo = self._slot_mask_lo[row, day_idx]
+        mhi = self._slot_mask_hi[row, day_idx]
         return (self._sel_lo & mlo) != 0 or (self._sel_hi & mhi) != 0
 
     def tt_cell_locked(self, row: int, col: int) -> bool:
@@ -1221,16 +1224,18 @@ class MainWindow(QMainWindow):
         d0 = max(0, min(len(self.show_days) - 1, d0))
         d1 = max(0, min(len(self.show_days) - 1, d1))
 
-        for di in range(d0, d1 + 1):
-            for rr in range(r0, r1 + 1):
-                mlo = self._slot_mask_lo[di][rr]
-                mhi = self._slot_mask_hi[di][rr]
-                if state:
-                    lo |= mlo
-                    hi |= mhi
-                else:
-                    lo &= (~mlo)
-                    hi &= (~mhi)
+        # Vectorized mask calculation for the selected rectangle
+        sub_mask_lo = self._slot_mask_lo[r0 : r1 + 1, d0 : d1 + 1]
+        sub_mask_hi = self._slot_mask_hi[r0 : r1 + 1, d0 : d1 + 1]
+        rect_mask_lo = np.bitwise_or.reduce(sub_mask_lo.ravel())
+        rect_mask_hi = np.bitwise_or.reduce(sub_mask_hi.ravel())
+
+        if state:  # select
+            lo |= rect_mask_lo
+            hi |= rect_mask_hi
+        else:  # deselect
+            lo &= ~rect_mask_lo
+            hi &= ~rect_mask_hi
 
         self._sel_lo = np.uint64(lo)
         self._sel_hi = np.uint64(hi)

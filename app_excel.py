@@ -141,16 +141,12 @@ def _build_courses_df_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Cache time parsing results to reduce repeated parsing on identical strings
-    time_cache = {}
-    parsed_results = []
-    for text in df["地點時間"]:
-        key = "" if text is None else str(text)
-        res = time_cache.get(key)
-        if res is None:
-            res = parse_time_text(text)
-            time_cache[key] = res
-        parsed_results.append(res)
+    # Vectorize time parsing for performance by parsing unique values only
+    unique_times = df["地點時間"].unique()
+    time_map = {t: parse_time_text(t) for t in unique_times}
+    parsed_results = df["地點時間"].map(time_map)
+
+    # Assign parsed results back to the DataFrame
     df["_slots_set"] = [res.slots for res in parsed_results]
     df["_slots"] = [sorted(res.slots, key=_slot_sort_key) for res in parsed_results]
     df["_tba"] = [res.tba for res in parsed_results]
