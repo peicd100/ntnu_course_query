@@ -98,7 +98,11 @@ def occupied_masks_from_arrays(
     return np.uint64(occ_lo), np.uint64(occ_hi)
 
 
-def build_lane_assignment_sorted(courses_df: pd.DataFrame, included_ids_sorted: np.ndarray) -> Tuple[Dict[int, int], int]:
+def build_lane_assignment_sorted(
+    courses_df: pd.DataFrame,
+    included_ids_sorted: np.ndarray,
+    parsed_slots_map: Optional[Dict[int, List[Tuple[str, str]]]] = None,
+) -> Tuple[Dict[int, int], int]:
     if included_ids_sorted is None or included_ids_sorted.size == 0:
         return {}, 1
     sub = _subset_courses_by_ids(courses_df, included_ids_sorted, ["_cid", "_slots_set"])
@@ -129,7 +133,11 @@ def build_lane_assignment_sorted(courses_df: pd.DataFrame, included_ids_sorted: 
             continue
 
         used = 0
-        for s in slots_set:
+        # Use pre-parsed slots if available
+        current_parsed = parsed_slots_map.get(cid_i) if parsed_slots_map else None
+        iterator = [f"{d}-{p}" for d, p in current_parsed] if current_parsed is not None else slots_set
+
+        for s in iterator:
             used |= used_by_slot.get(s, 0)
 
         bitlen = used.bit_length() + 2
@@ -142,7 +150,7 @@ def build_lane_assignment_sorted(courses_df: pd.DataFrame, included_ids_sorted: 
             max_lane = lane
 
         bit = 1 << (lane - 1)
-        for s in slots_set:
+        for s in iterator:
             used_by_slot[s] = used_by_slot.get(s, 0) | bit
 
     return lane_of, max_lane
@@ -153,6 +161,7 @@ def build_timetable_matrix_per_day_lanes_sorted(
     included_ids_sorted: np.ndarray,
     locked_ids_set: Set[int],
     show_days: List[str],
+    parsed_slots_map: Optional[Dict[int, List[Tuple[str, str]]]] = None,
 ) -> Tuple[
     List[List[str]],
     List[str],
@@ -161,7 +170,7 @@ def build_timetable_matrix_per_day_lanes_sorted(
     List[List[Optional[int]]],
     List[List[bool]],
 ]:
-    lane_map, _ = build_lane_assignment_sorted(courses_df, included_ids_sorted)
+    lane_map, _ = build_lane_assignment_sorted(courses_df, included_ids_sorted, parsed_slots_map)
     day_lanes: Dict[str, int] = {d: 1 for d in show_days}
 
     subset_meta = _subset_courses_by_ids(
@@ -178,8 +187,14 @@ def build_timetable_matrix_per_day_lanes_sorted(
         cid_i = int(cid)
         lane = lane_map.get(cid_i, 1)
         slots_set = slots if isinstance(slots, set) else set()
-        for slot in slots_set:
-            day, _per = slot.split("-", 1)
+        
+        # Use pre-parsed slots if available to avoid string split
+        current_parsed = parsed_slots_map.get(cid_i) if parsed_slots_map else None
+        
+        # Calculate max lanes per day
+        # If we have parsed slots, iterate them. Otherwise split strings.
+        iterator = current_parsed if current_parsed is not None else [s.split("-", 1) for s in slots_set if "-" in s]
+        for day, _per in iterator:
             if day in day_lanes and lane > day_lanes[day]:
                 day_lanes[day] = lane
 
@@ -227,8 +242,11 @@ def build_timetable_matrix_per_day_lanes_sorted(
         lane = lane_map.get(cid_i, 1)
         is_locked = (cid_i in locked_ids_set)
 
-        for slot in slots_set:
-            day, per = slot.split("-", 1)
+        # Use pre-parsed slots if available
+        current_parsed = parsed_slots_map.get(cid_i) if parsed_slots_map else None
+        iterator = current_parsed if current_parsed is not None else [s.split("-", 1) for s in slots_set if "-" in s]
+
+        for day, per in iterator:
             if day not in day_offset or per not in PERIOD_INDEX:
                 continue
 

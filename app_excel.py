@@ -214,12 +214,13 @@ def _build_courses_df_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
     display_cols = [c for c in df.columns if not str(c).startswith("_")]
     
-    # Using vectorized string concatenation is much faster than row-wise agg
-    all_text_series = pd.Series([""] * len(df), index=df.index, dtype=str)
-    for col in display_cols:
-        all_text_series += df[col].astype(str).fillna("") + " "
-    
-    df["_alltext"] = all_text_series.str.lower()
+    # Optimized _alltext generation using str.cat (faster than loop +=)
+    if display_cols:
+        # Convert all columns to string, replacing NaN with empty string
+        series_list = [df[c].fillna("").astype(str) for c in display_cols]
+        df["_alltext"] = series_list[0].str.cat(series_list[1:], sep=" ").str.lower()
+    else:
+        df["_alltext"] = ""
 
     # D-03: Sort by _cid to enable O(k log n) lookup in subset operations
     # This ensures the dataframe is physically sorted by course ID

@@ -58,7 +58,7 @@ class TestTimetableLogic(unittest.TestCase):
         # Test 10 and 30 (Conflict on Mon-1)
         # Should result in 2 lanes
         included = np.array([10, 30], dtype=np.int64)
-        lane_map, max_lane = build_lane_assignment_sorted(self.df, included)
+        lane_map, max_lane = build_lane_assignment_sorted(self.df, included, None)
         self.assertEqual(max_lane, 2)
         self.assertEqual(len(lane_map), 2)
         self.assertNotEqual(lane_map[10], lane_map[30])
@@ -66,7 +66,7 @@ class TestTimetableLogic(unittest.TestCase):
         # Test 10 and 20 (No conflict)
         # Should result in 1 lane
         included = np.array([10, 20], dtype=np.int64)
-        lane_map, max_lane = build_lane_assignment_sorted(self.df, included)
+        lane_map, max_lane = build_lane_assignment_sorted(self.df, included, None)
         self.assertEqual(max_lane, 1)
         self.assertEqual(lane_map[10], 1)
         self.assertEqual(lane_map[20], 1)

@@ -553,6 +553,9 @@ class ResultsModel(QAbstractTableModel):
             v = self._col_arrays[col_idx][real_row]
 
             if col_idx == self._cid_col_idx:
+                # Optimization: Use cached integer CID if available
+                if self._cid_col is not None:
+                    return int(self._cid_col[real_row])
                 try:
                     return int(str(v).strip())
                 except Exception:
@@ -587,7 +590,7 @@ class ResultsModel(QAbstractTableModel):
             # C-02: Use cached array access
             # col_name = self._display_columns[c2]
             v = self._col_arrays[c2][self._visible_rows[r]]
-            return "" if pd.isna(v) else str(v)
+            return "" if v is None or pd.isna(v) else str(v)
         return None
 
     def flags(self, index: QModelIndex):

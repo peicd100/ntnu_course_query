@@ -2934,101 +2934,6 @@ class MainWindow(QMainWindow):
                     slots.add((day, per))
         return slots
 
-    def _apply_timetable_background(
-        self,
-        widget: TimetableWidget,
-        col_day_idx: List[int],
-        id_matrix: List[List[Optional[int]]],
-        locked_matrix: List[List[bool]],
-        *,
-        diff_added_cids: Optional[Set[int]] = None,
-        diff_removed_cells: Optional[Set[Tuple[int, int]]] = None,
-    ) -> None:
-        cols = widget.columnCount()
-        rows = widget.rowCount()
-        if cols <= 0 or rows <= 0:
-            return
-        if len(col_day_idx) != cols:
-            return
-
-        # E-02: Use precomputed base brushes
-        for c in range(cols):
-            day_idx = col_day_idx[c]
-            brush = self._brush_cache_base[day_idx % len(self._brush_cache_base)]
-            header_item = widget.horizontalHeaderItem(c)
-            if header_item is not None:
-                if header_item.background() != brush:
-                    header_item.setBackground(brush)
-
-        black_bg = self._brush_black
-        white_fg = self._brush_white
-        added_brush = self._brush_added
-        added_fg = self._brush_added_fg
-        deleted_brush = self._brush_deleted
-
-        for c in range(cols):
-            day_idx = col_day_idx[c]
-            base_brush = self._brush_cache_base[day_idx % len(self._brush_cache_base)]
-            darker_brush = self._brush_cache_darker[day_idx % len(self._brush_cache_darker)]
-
-            course_to_shade: Dict[int, int] = {}
-            next_shade = 0
-            prev_cid: Optional[int] = None
-
-            for r in range(rows):
-                cid = id_matrix[r][c] if (r < len(id_matrix) and c < len(id_matrix[r])) else None
-                it = widget.item(r, c)
-                if it is None:
-                    it = QTableWidgetItem("")
-                    widget.setItem(r, c, it)
-
-                locked = False
-                if locked_matrix and r < len(locked_matrix) and c < len(locked_matrix[r]):
-                    locked = bool(locked_matrix[r][c])
-
-                if locked and (it.text() or "").strip():
-                    if it.background() != black_bg:
-                        it.setBackground(black_bg)
-                    if it.foreground() != white_fg:
-                        it.setForeground(white_fg)
-                    prev_cid = cid
-                    continue
-
-                if diff_added_cids and cid is not None and cid in diff_added_cids:
-                    if it.background() != added_brush:
-                        it.setBackground(added_brush)
-                    if it.foreground() != added_fg:
-                        it.setForeground(added_fg)
-                    prev_cid = cid
-                    continue
-
-                if it.foreground() != black_bg:
-                    it.setForeground(black_bg)
-
-                if cid is None:
-                    if it.background() != base_brush:
-                        it.setBackground(base_brush)
-                    prev_cid = None
-                    continue
-
-                if cid != prev_cid:
-                    if cid not in course_to_shade:
-                        course_to_shade[cid] = next_shade % 2
-                        next_shade += 1
-                shade = course_to_shade.get(cid, 0)
-                bg = base_brush if shade == 0 else darker_brush
-                if it.background() != bg:
-                    it.setBackground(bg)
-                prev_cid = cid
-
-        if diff_removed_cells:
-            for row, col in diff_removed_cells:
-                if 0 <= row < rows and 0 <= col < cols:
-                    cell = widget.item(row, col)
-                    if cell is not None:
-                        if cell.background() != deleted_brush:
-                            cell.setBackground(deleted_brush)
-
     def _render_timetable(
         self,
         widget: TimetableWidget,
@@ -3046,6 +2951,7 @@ class MainWindow(QMainWindow):
             included_sorted,
             locked_ids,
             self.show_days,
+            parsed_slots_map=self._parsed_slots_by_cid,
         )
         cols = len(col_day_idx)
         if store_state:
@@ -3075,37 +2981,21 @@ class MainWindow(QMainWindow):
             vlabels = PERIODS
         widget.setVerticalHeaderLabels(vlabels)
 
-        # E-04: Optimize slot_map collection
-        # Instead of scanning the matrix, use _collect_slots_for_ids on the included set
-        # We only need slots that are within show_days
-        full_slots = self._collect_slots_for_ids(set(included_sorted))
-        show_days_set = set(self.show_days)
-        slot_map: Set[Tuple[str, str]] = {
-            (d, p) for (d, p) in full_slots if d in show_days_set
-        }
-
-        for r in range(len(PERIODS)):
-            for c in range(cols):
-                # E-01: Reuse existing items
-                it = widget.item(r, c)
-                if it is None:
-                    it = QTableWidgetItem(matrix[r][c])
-                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                    it.setTextAlignment(Qt.AlignLeft | Qt.AlignTop)
-                    widget.setItem(r, c, it)
-                elif it.text() != matrix[r][c]:
-                    # Optimization: Only update text if changed to avoid unnecessary repaints
-                    it.setText(matrix[r][c])
-                else:
-                    pass
-
+        # Prepare for deleted cells calculation
         from app_constants import PERIOD_INDEX
-        deleted_cells: Optional[Set[Tuple[int, int]]] = None
+        removed_slots_map: Dict[int, Set[int]] = {} # day_idx -> set of row_indices
+
         if baseline_slots:
+            # E-04: Optimize slot_map collection
+            full_slots = self._collect_slots_for_ids(set(included_sorted))
+            show_days_set = set(self.show_days)
+            slot_map: Set[Tuple[str, str]] = {
+                (d, p) for (d, p) in full_slots if d in show_days_set
+            }
+            
             removed_slots = baseline_slots - slot_map
             if removed_slots:
                 day_index = {day: idx for idx, day in enumerate(self.show_days)}
-                temp_cells: Set[Tuple[int, int]] = set()
                 for day, per in removed_slots:
                     day_idx = day_index.get(day)
                     if day_idx is None:
@@ -3114,26 +3004,103 @@ class MainWindow(QMainWindow):
                         row_idx = PERIOD_INDEX[per] # E-03: Use PERIOD_INDEX
                     except KeyError:
                         continue # Should not happen if data is valid
-                    for c in range(cols):
-                        if c >= len(col_day_idx) or col_day_idx[c] != day_idx:
-                            continue
-                        cell = widget.item(row_idx, c)
-                        if cell is None:
-                            continue
-                        if (cell.text() or "").strip():
-                            continue
-                        temp_cells.add((row_idx, c))
-                if temp_cells:
-                    deleted_cells = temp_cells
+                    
+                    if day_idx not in removed_slots_map:
+                        removed_slots_map[day_idx] = set()
+                    removed_slots_map[day_idx].add(row_idx)
 
-        self._apply_timetable_background(
-            widget,
-            col_day_idx,
-            id_matrix,
-            locked_matrix,
-            diff_added_cids=diff_added_cids,
-            diff_removed_cells=deleted_cells,
-        )
+        # Combined loop for text setting and background application
+        # Iterate column-major to handle shading logic efficiently
+        
+        black_bg = self._brush_black
+        white_fg = self._brush_white
+        added_brush = self._brush_added
+        added_fg = self._brush_added_fg
+        deleted_brush = self._brush_deleted
+
+        for c in range(cols):
+            day_idx = col_day_idx[c]
+            
+            # Header background
+            brush = self._brush_cache_base[day_idx % len(self._brush_cache_base)]
+            header_item = widget.horizontalHeaderItem(c)
+            if header_item is not None:
+                if header_item.background() != brush:
+                    header_item.setBackground(brush)
+
+            # Column brushes
+            base_brush = self._brush_cache_base[day_idx % len(self._brush_cache_base)]
+            darker_brush = self._brush_cache_darker[day_idx % len(self._brush_cache_darker)]
+
+            course_to_shade: Dict[int, int] = {}
+            next_shade = 0
+            prev_cid: Optional[int] = None
+            
+            removed_rows = removed_slots_map.get(day_idx, set())
+
+            for r in range(len(PERIODS)):
+                # 1. Set Text
+                text = matrix[r][c]
+                it = widget.item(r, c)
+                if it is None:
+                    it = QTableWidgetItem(text)
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                    it.setTextAlignment(Qt.AlignLeft | Qt.AlignTop)
+                    widget.setItem(r, c, it)
+                elif it.text() != text:
+                    it.setText(text)
+                
+                # 2. Set Background/Foreground
+                cid = id_matrix[r][c]
+                
+                locked = False
+                if locked_matrix and r < len(locked_matrix) and c < len(locked_matrix[r]):
+                    locked = bool(locked_matrix[r][c])
+
+                # Priority 1: Locked
+                if locked and text.strip():
+                    if it.background() != black_bg:
+                        it.setBackground(black_bg)
+                    if it.foreground() != white_fg:
+                        it.setForeground(white_fg)
+                    prev_cid = cid
+                    continue
+
+                # Priority 2: Added (Diff)
+                if diff_added_cids and cid is not None and cid in diff_added_cids:
+                    if it.background() != added_brush:
+                        it.setBackground(added_brush)
+                    if it.foreground() != added_fg:
+                        it.setForeground(added_fg)
+                    prev_cid = cid
+                    continue
+
+                # Reset foreground if not locked/added
+                if it.foreground() != black_bg:
+                    it.setForeground(black_bg)
+
+                # Priority 3: Empty cell (check for deleted)
+                if cid is None:
+                    # Check if this empty cell corresponds to a removed slot
+                    if r in removed_rows and not text.strip():
+                        if it.background() != deleted_brush:
+                            it.setBackground(deleted_brush)
+                    else:
+                        if it.background() != base_brush:
+                            it.setBackground(base_brush)
+                    prev_cid = None
+                    continue
+
+                # Priority 4: Normal course (with shading)
+                if cid != prev_cid:
+                    if cid not in course_to_shade:
+                        course_to_shade[cid] = next_shade % 2
+                        next_shade += 1
+                shade = course_to_shade.get(cid, 0)
+                bg = base_brush if shade == 0 else darker_brush
+                if it.background() != bg:
+                    it.setBackground(bg)
+                prev_cid = cid
 
         if cols <= 12:
             widget.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -3377,7 +3344,10 @@ class MainWindow(QMainWindow):
                         matched = (self._cid_arr[valid_indices] == valid_inc)
                         mask[valid_indices[matched]] = False
                 else:
-                    cid_arr = df["_cid"].to_numpy(dtype=np.int64, copy=False)
+                    if "_cid" in df.columns:
+                        cid_arr = df["_cid"].to_numpy(dtype=np.int64, copy=False)
+                    else:
+                        cid_arr = np.array([], dtype=np.int64)
                     mask &= ~np.isin(cid_arr, inc_sorted)
 
         if not self.ck_show_tba.isChecked():
@@ -3459,14 +3429,17 @@ class MainWindow(QMainWindow):
                 def get_search_series(col_name, fallback_col=None):
                     if col_name in df.columns:
                         series = df[col_name]
+                        if is_subset:
+                            return series.iloc[indices]
+                        return series
                     elif fallback_col and fallback_col in df.columns:
-                        series = df[fallback_col].astype(str).str.lower()
+                        # Optimization: Subset first, then convert to string/lower
+                        source = df[fallback_col]
+                        if is_subset:
+                            source = source.iloc[indices]
+                        return source.astype(str).str.lower()
                     else:
                         return None
-                    
-                    if is_subset:
-                        return series.iloc[indices]
-                    return series
 
                 if full:
                     tokens = [t.strip().lower() for t in full.split() if t.strip()]

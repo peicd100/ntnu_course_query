@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 
 import numpy as np
 from PySide6.QtCore import QObject, QRunnable, Signal
@@ -72,6 +72,16 @@ class _HalfEntry:
     ids: tuple
     priority_sum: int
 
+
+class _BeamNode:
+    __slots__ = ('mask', 'credit', 'gened', 'priority_sum', 'cid', 'parent')
+    def __init__(self, mask, credit, gened, priority_sum, cid, parent):
+        self.mask = mask
+        self.credit = credit
+        self.gened = gened
+        self.priority_sum = priority_sum
+        self.cid = cid
+        self.parent = parent
 
 class BestScheduleWorker(QObject, QRunnable):
     finished = Signal(int, bool, bool, list, str)
@@ -246,11 +256,31 @@ class BestScheduleWorker(QObject, QRunnable):
             limit: int = 200000
         ) -> Dict[int, _HalfEntry]:
             # Beam Search implementation for large datasets
-            # Uses tuples for ids to allow easy pruning/reordering
-            # State: mask -> _HalfEntry
-            results: Dict[int, _HalfEntry] = {
-                0: _HalfEntry(mask=0, credit=0.0, gened=0, ids=(), priority_sum=0)
+            # Uses _BeamNode (linked list) to save memory by avoiding tuple creation at each step
+            # State: mask -> _BeamNode
+            results: Dict[int, _BeamNode] = {
+                0: _BeamNode(mask=0, credit=0.0, gened=0, priority_sum=0, cid=0, parent=None)
             }
+
+            def reconstruct_ids_from_node(node: _BeamNode) -> tuple:
+                path = []
+                curr = node
+                while curr.parent is not None: # Stop at root (which has parent None)
+                    path.append(curr.cid)
+                    curr = curr.parent
+                return tuple(reversed(path))
+
+            def better_node(a: _BeamNode, b: _BeamNode) -> bool:
+                if a.credit != b.credit:
+                    return a.credit > b.credit
+                if a.priority_sum != b.priority_sum:
+                    return a.priority_sum < b.priority_sum
+                
+                ids_a = reconstruct_ids_from_node(a)
+                ids_b = reconstruct_ids_from_node(b)
+                ka = order_key_for_ids(ids_a)
+                kb = order_key_for_ids(ids_b)
+                return ka < kb
             
             total_items = len(items_half)
             for idx, (cid, credit, gened, mask, order_val) in enumerate(items_half, start=1):
@@ -265,16 +295,17 @@ class BestScheduleWorker(QObject, QRunnable):
                         continue
                     
                     new_mask = entry.mask | mask
-                    new_entry = _HalfEntry(
+                    new_entry = _BeamNode(
                         mask=new_mask,
                         credit=entry.credit + credit,
                         gened=entry.gened + gened,
-                        ids=entry.ids + (cid,),
-                        priority_sum=entry.priority_sum + order_val
+                        priority_sum=entry.priority_sum + order_val,
+                        cid=cid,
+                        parent=entry
                     )
                     
                     existing = results.get(new_mask)
-                    if existing is None or better_entry(new_entry, existing):
+                    if existing is None or better_node(new_entry, existing):
                         results[new_mask] = new_entry
                 
                 # Prune if too large
@@ -289,7 +320,17 @@ class BestScheduleWorker(QObject, QRunnable):
                     pct = progress_start + int(progress_span * (idx / total_items))
                     self._emit_progress(pct)
             
-            return results
+            # Convert _BeamNode back to _HalfEntry for compatibility
+            final_results = {}
+            for m, node in results.items():
+                final_results[m] = _HalfEntry(
+                    mask=m,
+                    credit=node.credit,
+                    gened=node.gened,
+                    ids=reconstruct_ids_from_node(node),
+                    priority_sum=node.priority_sum
+                )
+            return final_results
 
         def enumerate_half(
             items_half: List[Tuple[int, float, int, int, int]],
